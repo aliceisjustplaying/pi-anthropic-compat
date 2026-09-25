@@ -10,7 +10,6 @@ import { sendSummaryRequest, supportsCompaction } from "./client.ts";
 import { loadConfig, type Config } from "./config.ts";
 import { object, type JsonObject } from "./json.ts";
 import {
-  BOUNDARY_TYPE,
   CHECKPOINT_TYPE,
   TEMPLATE_TYPE,
   checkpoint,
@@ -127,10 +126,20 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
         AbortSignal.timeout(configuration(ctx).timeoutSeconds * 1000),
       ]);
       signal.throwIfAborted();
-      const active = buildSessionContext(branch, leaf).messages;
+      requireCompletedTools(convertToLlm(buildSessionContext(branch, leaf).messages));
+      // Emulated keep-tail: summarize only what Pi's own split (compaction.keepRecentTokens)
+      // discards. Pi keeps entries from firstKeptEntryId verbatim after the summary.
+      // Signed thinking in kept messages no longer matches its original prefix, so
+      // Anthropic drops it by default; no prefix_mismatch_behavior is requested.
+      const { preparation } = event;
       const messages = convertToLlm(
-        saved ? active.filter((message) => message.role !== "compactionSummary") : active,
+        [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages].filter(
+          (message) => message.role !== "compactionSummary",
+        ),
       );
+      if (!messages.some((message) => message.role === "user" || message.role === "assistant")) {
+        throw new Error("Nothing to summarize before the kept messages.");
+      }
       requireCompletedTools(messages);
       const maxTokens = Math.min(configuration(ctx).maxSummaryTokens, model.maxTokens);
       const level = pi.getThinkingLevel();
@@ -191,9 +200,7 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
       ) {
         throw new Error("The session changed during compaction. The summary was not applied.");
       }
-      pi.appendEntry(BOUNDARY_TYPE, { version: 1 });
-      const boundary = ctx.sessionManager.getLeafId();
-      if (!boundary) throw new Error("Could not record the compaction boundary.");
+      const boundary = preparation.firstKeptEntryId;
       return {
         compaction: {
           summary: summary.summary,

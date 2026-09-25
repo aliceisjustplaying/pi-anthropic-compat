@@ -65,6 +65,8 @@ async function setup(
     persistent?: boolean;
     /** Register a pi-black-style native wrapper around the built-in Anthropic provider. */
     black?: boolean;
+    /** Pi's compaction.keepRecentTokens. */
+    keep?: number;
     managed?: boolean;
     modelId?: "claude-opus-5-5";
     /** Replace the serialized system prompt at the payload boundary. Default: true. */
@@ -138,7 +140,7 @@ async function setup(
     const settings = SettingsManager.inMemory({
       compaction: {
         enabled: options.automatic ?? false,
-        keepRecentTokens: 1,
+        keepRecentTokens: options.keep ?? 1,
         reserveTokens: 16384,
       },
       retry: { enabled: false, provider: { maxRetries: 0 } },
@@ -215,10 +217,10 @@ test("real Pi session compacts, replays exactly one native block, and retains or
   const result = await session.compact("Preserve the project name.");
   assert.equal(result.summary, block["content"]);
   assert.equal(result.usage?.input, 194);
-  // Pi 0.86 leads the compacted context with its prompt and tool snapshot.
+  // Pi leads with its prompt snapshot; Pi's split keeps the last response verbatim.
   assert.deepEqual(
     session.messages.map((message) => message.role),
-    ["system", "compactionSummary"],
+    ["system", "compactionSummary", "assistant"],
   );
   assert.equal(
     manager.getEntries().filter((entry) => entry.type === "message").length,
@@ -357,4 +359,26 @@ test("works underneath a pi-black-style provider wrapper", async (t) => {
   assert.match(JSON.stringify(objects(latest["system"])[0]), /cch=abcde/);
   assert.deepEqual(objects(latest["messages"])[0], { role: "assistant", content: [block] });
   assert.match(headers.at(-1)?.get("anthropic-beta") ?? "", /compact-2026-09-04/);
+});
+
+test("emulated keep-tail summarizes older turns and replays recent ones verbatim", async (t) => {
+  const { session, manager, requests } = await setup(t, { keep: 30 });
+  await session.prompt("Old turn about the synthetic project Lantern.");
+  await session.prompt("Old turn two.");
+  await session.prompt("Recent turn about Beacon.");
+  await session.compact();
+  const saved = manager.getBranch().findLast((entry) => entry.type === "compaction");
+  assert.ok(saved?.type === "compaction");
+  assert.notEqual(saved.firstKeptEntryId, manager.getLeafId());
+  const summary = requests.find((request) => request["compaction"]);
+  assert.ok(summary);
+  assert.match(JSON.stringify(summary["messages"]), /Old turn about/);
+  assert.doesNotMatch(JSON.stringify(summary["messages"]), /Beacon/);
+  await session.prompt("Continue.");
+  const latest = requests.at(-1);
+  assert.ok(latest);
+  const messages = objects(latest["messages"]);
+  assert.deepEqual(messages[0], { role: "assistant", content: [block] });
+  assert.match(JSON.stringify(messages), /Recent turn about Beacon/);
+  assert.doesNotMatch(JSON.stringify(messages), /Old turn about/);
 });

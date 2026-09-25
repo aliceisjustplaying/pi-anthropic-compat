@@ -12,8 +12,11 @@ This fork differs from upstream:
   summary requests through `ctx.modelRegistry.streamSimple`, so the registered
   provider (for example pi-black's Claude Code billing block, headers and `cch`
   signature) applies to both.
-- **Keep-tail retention is removed.** Compaction always summarizes the full
-  active conversation. No per-turn request-boundary entries are written.
+- **Keep-tail is emulated with Pi's own split.** Only the messages Pi would
+  discard (sized by Pi's `compaction.keepRecentTokens`) are summarized. Pi keeps
+  the rest verbatim after the signed block. Signed thinking in kept messages is
+  not bound to its original prefix, so Anthropic may drop it. No per-turn
+  request-boundary entries are written.
 - **Nothing is recorded while native compaction is off.** The system/tools
   template is recorded only when enabled, and only when it changes.
 
@@ -44,7 +47,7 @@ The extension:
 - uses Pi's Anthropic serializer and authentication;
 - checks the selected model's live compaction capability before summarizing;
 - preserves the complete signed block, including opaque fields;
-- summarizes the full active conversation;
+- summarizes the older part of the conversation and keeps Pi's recent messages;
 - sends the signed block first on later Anthropic requests;
 - preserves original messages in Pi's append-only session tree;
 - persists the checkpoint for resume, reload, and branch navigation;
