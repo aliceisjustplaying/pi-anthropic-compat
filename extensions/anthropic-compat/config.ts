@@ -7,14 +7,12 @@ import { object, type JsonObject } from "./json.ts";
 
 export type Config = {
   enabled: boolean;
-  keepRecentTokens: number;
   maxSummaryTokens: number;
   timeoutSeconds: number;
 };
 
 export const DEFAULT_CONFIG: Config = {
   enabled: false,
-  keepRecentTokens: 0,
   maxSummaryTokens: 4096,
   timeoutSeconds: 120,
 };
@@ -34,7 +32,6 @@ export function parseConfig(data: JsonObject, base: Config = DEFAULT_CONFIG): Co
     result.enabled = data["enabled"];
   }
   for (const [key, minimum, maximum] of [
-    ["keepRecentTokens", 0, 200000],
     ["maxSummaryTokens", 1024, 32768],
     ["timeoutSeconds", 10, 600],
   ] as const) {

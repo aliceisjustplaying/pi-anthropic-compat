@@ -1,5 +1,5 @@
 import { object, type JsonObject } from "./json.ts";
-import { COMPACTION_BETA, summaryPayload } from "./protocol.ts";
+import { COMPACTION_BETA } from "./protocol.ts";
 
 export function betaHeaders(original: Headers): Headers {
   const headers = new Headers(original);
@@ -43,21 +43,21 @@ export async function supportsCompaction(
   return supported;
 }
 
-export async function compactRequest(
+export async function sendSummaryRequest(
   request: Request,
-  maxTokens: number,
   signal: AbortSignal,
-  instructions?: string,
   fetcher = fetch,
 ): Promise<JsonObject> {
-  const payload = summaryPayload(object(await request.json()), maxTokens, instructions);
-  // SDK-only fields have already become HTTP headers at this boundary.
-  delete payload["betas"];
+  // Send the final body unchanged: provider wrappers such as pi-black sign it (cch).
+  const body = await request.text();
+  if (object(JSON.parse(body))["compaction"] === undefined) {
+    throw new Error("The provider dropped the compaction request. History was preserved.");
+  }
   return readResponse(
     await fetcher(request.url, {
       method: "POST",
       headers: betaHeaders(request.headers),
-      body: JSON.stringify(payload),
+      body,
       signal,
       redirect: "error",
     }),

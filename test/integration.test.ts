@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +12,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   registerCompatibility,
   activeCheckpoint,
@@ -20,6 +23,39 @@ import {
 import { object, objects, type JsonObject } from "../extensions/anthropic-compat/json.ts";
 import { block, model, summaryResponse, textResponse } from "./fixtures.ts";
 
+const BILLING = "x-anthropic-billing-header: cc_version=test; cch=00000;";
+
+/** Mirrors pi-black: wraps the built-in provider, prepends a billing block in
+ * `onPayload` after earlier transforms, and signs the serialized body in `fetch`. */
+function fakeBlack(pi: ExtensionAPI): void {
+  const anthropic = builtinProviders().find((provider) => provider.id === "anthropic");
+  assert.ok(anthropic);
+  const merge = <T extends SimpleStreamOptions | undefined>(options: T): T => {
+    if (!options) return options;
+    const transport = options.fetch ?? globalThis.fetch;
+    return {
+      ...options,
+      onPayload: async (payload: unknown, selected: Model<Api>) => {
+        const prior = object((await options.onPayload?.(payload, selected)) ?? payload);
+        const system = Array.isArray(prior["system"]) ? prior["system"] : [];
+        return { ...prior, system: [{ type: "text", text: BILLING }, ...system] };
+      },
+      fetch: async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const request = new Request(input, init);
+        const body = (await request.text()).replace("cch=00000", "cch=abcde");
+        const signed = new Headers(request.headers);
+        signed.set("x-fake-black", "1");
+        signed.delete("content-length");
+        return transport(request.url, { method: request.method, headers: signed, body });
+      },
+    };
+  };
+  pi.registerProvider({
+    ...anthropic,
+    streamSimple: (m, c, o) => anthropic.streamSimple(m, c, merge(o)),
+  });
+}
+
 async function setup(
   t: TestContext,
   options: {
@@ -27,7 +63,8 @@ async function setup(
     fail?: boolean;
     enabled?: boolean;
     persistent?: boolean;
-    keepRecentTokens?: number;
+    /** Register a pi-black-style native wrapper around the built-in Anthropic provider. */
+    black?: boolean;
     managed?: boolean;
     modelId?: "claude-opus-5-5";
     /** Replace the serialized system prompt at the payload boundary. Default: true. */
@@ -39,10 +76,7 @@ async function setup(
   await mkdir(agentDir);
   await writeFile(
     join(agentDir, "pi-anthropic-compat.json"),
-    JSON.stringify({
-      enabled: options.enabled ?? true,
-      keepRecentTokens: options.keepRecentTokens ?? 0,
-    }),
+    JSON.stringify({ enabled: options.enabled ?? true }),
   );
   const original = process.env["PI_CODING_AGENT_DIR"];
   process.env["PI_CODING_AGENT_DIR"] = agentDir;
@@ -51,6 +85,7 @@ async function setup(
     else process.env["PI_CODING_AGENT_DIR"] = original;
   });
   const requests: JsonObject[] = [];
+  const headers: Headers[] = [];
   let ordinary = 0;
   let contextWindow = model.contextWindow;
   let onSummary: (() => void) | undefined;
@@ -65,6 +100,7 @@ async function setup(
   const fetcher: typeof fetch = async (input, init) => {
     const request = new Request(input, init);
     assert.equal(new URL(request.url).origin, "https://api.anthropic.com");
+    headers.push(request.headers);
     if (request.method === "GET") {
       return Response.json({ capabilities: { compaction: { summarize: { supported: true } } } });
     }
@@ -117,14 +153,16 @@ async function setup(
       noContextFiles: true,
       systemPromptOverride: () => "Synthetic system before patch.",
       extensionFactories: [
-        (pi) => registerCompatibility(pi, fetcher),
-        // A later-loaded system-prompt transformer must remain effective.
+        ...(options.black ? [fakeBlack] : []),
+        // A system-prompt transformer loaded before this extension is captured in the
+        // template. Transformers loaded after it are not; load this extension last.
         (pi) =>
           pi.on("before_provider_request", (event) =>
             options.patchSystem === false
               ? undefined
               : { ...object(event.payload), system: [{ type: "text", text: system }] },
           ),
+        (pi) => registerCompatibility(pi, fetcher),
         // Structured prompt changes persist as later transcript system messages.
         (pi) =>
           pi.on("before_agent_start", (event) => {
@@ -155,6 +193,7 @@ async function setup(
     session,
     manager,
     requests,
+    headers,
     create,
     setSystem: (value: string) => {
       system = value;
@@ -205,34 +244,20 @@ test("real Pi session compacts, replays exactly one native block, and retains or
   assert.deepEqual(objects(repeated["messages"])[0], { role: "assistant", content: [block] });
 });
 
-for (const keepRecentTokens of [0, 1]) {
-  test(`Opus 5.5 compacts and replays with keepRecentTokens=${keepRecentTokens}`, async (t) => {
-    const { session, manager, requests } = await setup(t, {
-      modelId: "claude-opus-5-5",
-      managed: true,
-      keepRecentTokens,
-    });
-    await session.prompt("Remember the synthetic project Lantern.");
-    await session.compact();
-    const saved = activeCheckpoint(manager.getBranch());
-    assert.equal(saved?.model, "claude-opus-5-5");
-    assert.equal(Boolean(saved?.retained), keepRecentTokens > 0);
-    await session.prompt("Continue.");
-    const latest = requests.at(-1);
-    assert.ok(latest);
-    assert.equal(latest["model"], "claude-opus-5-5");
-    assert.deepEqual(objects(latest["messages"])[0], {
-      role: "assistant",
-      content: [block],
-    });
-    if (saved?.retained) {
-      assert.deepEqual(
-        objects(latest["messages"]).slice(1, 1 + saved.retained.messages.length),
-        saved.retained.messages,
-      );
-    }
+test("Opus 5.5 compacts and replays", async (t) => {
+  const { session, manager, requests } = await setup(t, {
+    modelId: "claude-opus-5-5",
+    managed: true,
   });
-}
+  await session.prompt("Remember the synthetic project Lantern.");
+  await session.compact();
+  assert.equal(activeCheckpoint(manager.getBranch())?.model, "claude-opus-5-5");
+  await session.prompt("Continue.");
+  const latest = requests.at(-1);
+  assert.ok(latest);
+  assert.equal(latest["model"], "claude-opus-5-5");
+  assert.deepEqual(objects(latest["messages"])[0], { role: "assistant", content: [block] });
+});
 
 test("native replay and manual compaction survive extension reload and branch navigation", async (t) => {
   const { session, manager, requests, create } = await setup(t, { persistent: true });
@@ -308,250 +333,28 @@ test("disabled feature leaves ordinary requests unchanged", async (t) => {
   assert.equal(requests[0]?.["compaction"], undefined);
 });
 
-test("keep-tail compaction preserves thinking, survives cold resume, and compacts repeatedly", async (t) => {
-  const { session, manager, requests, create } = await setup(t, {
-    keepRecentTokens: 1,
-    managed: true,
-    persistent: true,
-  });
-  await session.prompt("Older facts.");
-  await session.prompt("Recent facts.");
-  const before = manager.getLeafId();
-  const original = [...session.messages];
+test("works underneath a pi-black-style provider wrapper", async (t) => {
+  const { session, manager, requests, headers } = await setup(t, { black: true });
+  await session.prompt("Remember the synthetic project Lantern.");
   await session.compact();
-  const saved = activeCheckpoint(manager.getBranch());
-  assert.ok(saved?.retained);
-  assert.equal(saved.retained.messages[0]?.["role"], "assistant");
-  assert.ok(saved.retained.leading);
-  assert.deepEqual(
-    session.messages.map((message) => message.role),
-    ["system", "compactionSummary", "assistant"],
-  );
-  assert.deepEqual(session.messages[2], original.at(-1));
-  const summary = requests.at(-1);
+  assert.ok(activeCheckpoint(manager.getBranch()));
+  const summary = requests.find((request) => request["compaction"]);
   assert.ok(summary);
-  // The last response is kept, not summarized.
-  assert.equal(objects(summary["messages"]).at(-1)?.["role"], "system");
-  assert.equal(
-    object(object(summary["thinking"])["block_binding"])["prefix_mismatch_behavior"],
-    "error",
-  );
-  const file = manager.getSessionFile();
-  assert.ok(file);
-  session.dispose();
-  const restored = SessionManager.open(file);
-  const resumed = await create(restored);
-  await resumed.prompt("Continue after restart.");
-  const request = requests.at(-1);
-  assert.ok(request);
-  const replayed = objects(request["messages"]);
-  assert.deepEqual(replayed[0], { role: "assistant", content: [block] });
-  assert.deepEqual(replayed.slice(1, 1 + saved.retained.messages.length), saved.retained.messages);
-  assert.equal(
-    object(object(request["thinking"])["block_binding"])["prefix_mismatch_behavior"],
-    "error",
-  );
-  await resumed.compact();
-  assert.ok(activeCheckpoint(restored.getBranch())?.retained);
-  assert.ok(before);
-  await resumed.navigateTree(before, { summarize: false });
-  assert.equal(activeCheckpoint(restored.getBranch()), undefined);
-  await resumed.prompt("Original history branch.");
-  assert.equal(JSON.stringify(requests.at(-1)).includes("test-signature"), false);
-});
-
-test("tail retention cancels without a qualifying recorded boundary and never falls back to full history", async (t) => {
-  const { session, manager, requests } = await setup(t, { keepRecentTokens: 200000 });
-  await session.prompt("A short conversation.");
-  const leaf = manager.getLeafId();
-  await assert.rejects(session.compact(), /cancelled/i);
-  assert.equal(manager.getLeafId(), leaf);
-  assert.equal(requests.length, 1);
-});
-
-test("changed system instructions reject native tail selection and replay before transmission", async (t) => {
-  const { session, manager, requests, setSystem } = await setup(t, { keepRecentTokens: 1 });
-  await session.prompt("Original system.");
-  const leaf = manager.getLeafId();
-  setSystem("Changed system.");
-  await assert.rejects(session.compact(), /cancelled/i);
-  assert.equal(manager.getLeafId(), leaf);
-  assert.equal(requests.length, 1);
-  setSystem("Patched synthetic system.");
-  await session.compact();
-  setSystem("Changed again.");
-  await session.prompt("Must not transmit.");
-  assert.equal(requests.length, 2);
-  const last = session.messages.at(-1);
-  assert.ok(last?.role === "assistant" && last.stopReason === "error");
-});
-
-test("automatic compaction can retain the last native response", async (t) => {
-  const { session, manager } = await setup(t, {
-    keepRecentTokens: 1,
-    automatic: true,
-    managed: true,
+  // The summary passed through the wrapper: billing block first, body signed.
+  assert.deepEqual(objects(summary["system"])[0], {
+    type: "text",
+    text: BILLING.replace("cch=00000", "cch=abcde"),
   });
-  await session.prompt("Automatic retained thinking.");
-  assert.ok(activeCheckpoint(manager.getBranch())?.retained);
-  assert.deepEqual(
-    session.messages.map((message) => message.role),
-    ["system", "compactionSummary", "assistant"],
-  );
-});
-
-test("retention rounds up to an earlier safe request when the latest response is too small", async (t) => {
-  const { session, manager, requests } = await setup(t, { keepRecentTokens: 16 });
-  await session.prompt("Old facts.");
-  await session.prompt("Recent exact instruction with enough text to retain across compaction.");
-  const original = [...session.messages];
-  await session.compact();
-  assert.equal(session.messages[0]?.role, "system");
-  assert.equal(session.messages[1]?.role, "compactionSummary");
-  assert.deepEqual(session.messages.slice(2), original.slice(2));
-  assert.equal(activeCheckpoint(manager.getBranch())?.retained?.messages.length, 3);
-  const request = requests.at(-1);
-  assert.ok(request);
-  assert.equal(objects(request["messages"]).length, 1);
-  assert.equal(JSON.stringify(request["messages"]).includes("Recent exact instruction"), false);
-});
-
-test("retained replay survives a prompt update after the checkpoint", async (t) => {
-  // Fable-class models receive later sections in place. Pi 0.87 folds them into the
-  // leading prompt when a `context` handler changes the message list, which would
-  // change the bound `system` template and reject the retained history.
-  const { session, requests, setSection } = await setup(t, {
-    keepRecentTokens: 1,
-    managed: true,
-    patchSystem: false,
+  assert.deepEqual(objects(summary["system"])[1], {
+    type: "text",
+    text: "Patched synthetic system.",
   });
-  await session.prompt("Older facts.");
-  await session.prompt("Recent facts.");
-  await session.compact();
-  const saved = activeCheckpoint(session.sessionManager.getBranch());
-  assert.ok(saved?.retained);
-  setSection("Updated after the checkpoint.");
-  await session.prompt("Continue with the update.");
-  const last = session.messages.at(-1);
-  assert.ok(last?.role === "assistant");
-  assert.equal(last.stopReason, "stop", last.errorMessage);
-  const request = requests.at(-1);
-  assert.ok(request);
-  assert.equal(JSON.stringify(request["system"]).includes("Updated after the checkpoint"), false);
-  const replayed = objects(request["messages"]);
-  assert.deepEqual(replayed[0], { role: "assistant", content: [block] });
-  assert.ok(replayed.some((message) => message["role"] === "system"));
-  assert.match(JSON.stringify(replayed), /Updated after the checkpoint/);
-});
-
-test("context edits on retained entries are honoured", async (t) => {
-  const { session, manager, requests } = await setup(t, { keepRecentTokens: 1 });
-  await session.prompt("Older facts.");
-  await session.prompt("Recent facts.");
-  const answer = manager
-    .getBranch()
-    .findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
-  assert.ok(answer);
-  manager.appendContextEdit(answer.id, { content: "Edited recent answer." });
-  session.refreshContext();
-  await session.compact();
-  const saved = activeCheckpoint(manager.getBranch());
-  assert.ok(saved?.retained);
-  assert.match(JSON.stringify(saved.retained.messages), /Edited recent answer/);
+  assert.ok(headers.every((value) => value.get("x-fake-black") === "1"));
+  assert.match(headers.at(-1)?.get("anthropic-beta") ?? "", /compact-2026-09-04/);
   await session.prompt("Continue.");
-  const replayed = objects(object(requests.at(-1))["messages"]);
-  assert.deepEqual(replayed[0], { role: "assistant", content: [block] });
-  assert.match(JSON.stringify(replayed[1]), /Edited recent answer/);
-});
-
-test("prompt updates folded into the compaction snapshot cancel keep-tail before billing", async (t) => {
-  // Fable-class models receive later prompt sections in place, so the request prompt stays
-  // the initial one. Pi's compaction snapshot replays the section into the leading prompt,
-  // which the retained thinking was never bound to.
-  const { session, manager, requests, setSection } = await setup(t, {
-    keepRecentTokens: 1,
-    managed: true,
-    patchSystem: false,
-  });
-  await session.prompt("Before the prompt update.");
-  setSection("Added mid-conversation.");
-  await session.prompt("After the prompt update.");
-  const request = requests.at(-1);
-  assert.ok(request);
-  assert.equal(JSON.stringify(request["system"]).includes("Added mid-conversation"), false);
-  assert.match(JSON.stringify(request["messages"]), /Added mid-conversation/);
-  const leaf = manager.getLeafId();
-  await assert.rejects(session.compact(), /cancelled/i);
-  assert.equal(manager.getLeafId(), leaf);
-  assert.equal(activeCheckpoint(manager.getBranch()), undefined);
-  assert.equal(
-    requests.some((entry) => entry["compaction"] !== undefined),
-    false,
-  );
-});
-
-test("prompt updates collapsed into the leading prompt keep later turns retainable", async (t) => {
-  const { session, manager, requests, setSection } = await setup(t, {
-    keepRecentTokens: 1,
-    patchSystem: false,
-  });
-  await session.prompt("Before the prompt update.");
-  setSection("Collapsed mid-conversation.");
-  await session.prompt("Bound to the updated prompt.");
-  await session.prompt("Retained after the update.");
-  await session.compact();
-  const saved = activeCheckpoint(manager.getBranch());
-  assert.equal(saved?.retained?.messages.length, 1);
-  const summary = requests.findLast((entry) => entry["compaction"] !== undefined);
-  assert.ok(summary);
-  assert.match(JSON.stringify(summary["system"]), /Collapsed mid-conversation/);
-  // The summarized prefix ends with the last user turn; only its response is retained.
-  assert.equal(objects(summary["messages"]).at(-1)?.["role"], "user");
-  assert.equal(saved?.retained?.messages[0]?.["role"], "assistant");
-  await session.prompt("Continue.");
-  const replayed = objects(object(requests.at(-1))["messages"]);
-  assert.deepEqual(replayed[0], { role: "assistant", content: [block] });
-  assert.deepEqual(replayed.slice(1, 2), saved?.retained?.messages);
-});
-
-test("system changes while summarization runs invalidate the result before it is applied", async (t) => {
-  const { session, manager, requests, setSystem, interrupt } = await setup(t, {
-    keepRecentTokens: 1,
-  });
-  await session.prompt("Original instructions.");
-  const leaf = manager.getLeafId();
-  interrupt(() => setSystem("Changed during the summary."));
-  await assert.rejects(session.compact(), /cancelled/i);
-  assert.equal(manager.getLeafId(), leaf);
-  assert.equal(activeCheckpoint(manager.getBranch()), undefined);
-  assert.equal(requests.length, 2);
-});
-
-test("forked sessions replay the exact retained thinking without modifying the original file", async (t) => {
-  const { session, manager, requests, create } = await setup(t, {
-    keepRecentTokens: 1,
-    managed: true,
-    persistent: true,
-  });
-  await session.prompt("Forkable native history.");
-  await session.compact();
-  const saved = activeCheckpoint(manager.getBranch());
-  assert.ok(saved?.retained);
-  const file = manager.getSessionFile();
-  const leaf = manager.getLeafId();
-  assert.ok(file && leaf);
-  session.dispose();
-  const original = await readFile(file, "utf8");
-  const forkManager = SessionManager.open(file);
-  const forkFile = forkManager.createBranchedSession(leaf);
-  assert.ok(forkFile && forkFile !== file);
-  const fork = await create(forkManager);
-  await fork.prompt("Continue on the fork.");
-  const payload = requests.at(-1);
-  assert.ok(payload);
-  assert.deepEqual(
-    objects(payload["messages"]).slice(1, 1 + saved.retained.messages.length),
-    saved.retained.messages,
-  );
-  assert.equal(await readFile(file, "utf8"), original);
+  const latest = requests.at(-1);
+  assert.ok(latest);
+  assert.match(JSON.stringify(objects(latest["system"])[0]), /cch=abcde/);
+  assert.deepEqual(objects(latest["messages"])[0], { role: "assistant", content: [block] });
+  assert.match(headers.at(-1)?.get("anthropic-beta") ?? "", /compact-2026-09-04/);
 });

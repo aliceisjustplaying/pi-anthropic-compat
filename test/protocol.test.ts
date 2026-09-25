@@ -10,7 +10,7 @@ import {
   summaryPayload,
 } from "../extensions/anthropic-compat/protocol.ts";
 import { object, objects } from "../extensions/anthropic-compat/json.ts";
-import { compactRequest, supportsCompaction } from "../extensions/anthropic-compat/client.ts";
+import { sendSummaryRequest, supportsCompaction } from "../extensions/anthropic-compat/client.ts";
 import { block, model, summaryResponse } from "./fixtures.ts";
 import { requireCompletedTools } from "../extensions/anthropic-compat/runtime.ts";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
@@ -125,11 +125,18 @@ test("summary accounting includes compaction iterations exactly once", () => {
   assert.throws(() => parseSummary({ ...response, usage: {} }, model), /JSON array/);
 });
 
+const SIGNED = JSON.stringify({
+  model: model.id,
+  system: [{ type: "text", text: "x-anthropic-billing-header: cch=abcde;" }],
+  messages: [{ role: "user", content: "Synthetic" }],
+  compaction: { type: "summarize" },
+});
+
 test("native HTTP calls preserve authentication without exposing response errors", async () => {
   const request = new Request("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": "test-only", "anthropic-beta": "existing-beta" },
-    body: JSON.stringify({ model: model.id, messages: [{ role: "user", content: "Synthetic" }] }),
+    body: SIGNED,
   });
   const signal = new AbortController().signal;
   let calls = 0;
@@ -140,21 +147,16 @@ test("native HTTP calls preserve authentication without exposing response errors
     calls++;
     if (outgoing.method === "GET")
       return Response.json({ capabilities: { compaction: { summarize: { supported: true } } } });
-    const payload = object(await outgoing.json());
-    assert.deepEqual(object(payload["compaction"])["type"], "summarize");
-    assert.equal(payload["betas"], undefined);
+    // The signed body is forwarded byte for byte.
+    assert.equal(await outgoing.text(), SIGNED);
     return Response.json(summaryResponse());
   };
   assert.equal(await supportsCompaction(request, model.id, signal, fetcher), true);
-  await compactRequest(request, 4096, signal, undefined, fetcher);
+  await sendSummaryRequest(request.clone(), signal, fetcher);
   assert.equal(calls, 2);
   await assert.rejects(
-    compactRequest(
-      new Request(request.url, { method: "POST", body: "{}" }),
-      4096,
-      signal,
-      undefined,
-      () => Promise.resolve(new Response("private error body", { status: 529 })),
+    sendSummaryRequest(new Request(request.url, { method: "POST", body: SIGNED }), signal, () =>
+      Promise.resolve(new Response("private error body", { status: 529 })),
     ),
     /HTTP 529/,
   );
@@ -188,10 +190,10 @@ test("unanswered tools cannot be compacted and completed pairs remain valid", ()
 test("malformed successful provider responses never expose raw response bodies", async () => {
   const request = new Request("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    body: "{}",
+    body: SIGNED,
   });
   await assert.rejects(
-    compactRequest(request, 4096, new AbortController().signal, undefined, () =>
+    sendSummaryRequest(request, new AbortController().signal, () =>
       Promise.resolve(new Response("private fixture response", { status: 200 })),
     ),
     { message: "Anthropic returned an invalid JSON response. History was preserved." },

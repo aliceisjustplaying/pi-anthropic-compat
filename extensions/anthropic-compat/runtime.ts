@@ -1,15 +1,4 @@
-// Pi resolves only the pi-ai root, `/compat`, `/oauth`, and `/providers/all` for installed
-// extensions. The `/api/*` subpaths are unavailable outside a development checkout.
-import { anthropicMessagesApi } from "@earendil-works/pi-ai/compat";
-import {
-  getCurrentSystemMessage,
-  normalizeContext,
-  type Api,
-  type Message,
-  type Model,
-  type SimpleStreamOptions,
-  type TranscriptContext,
-} from "@earendil-works/pi-ai";
+import { normalizeContext, type Message, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
   buildSessionContext,
@@ -17,58 +6,27 @@ import {
   type ExtensionContext,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { compactRequest, supportsCompaction } from "./client.ts";
+import { sendSummaryRequest, supportsCompaction } from "./client.ts";
 import { loadConfig, type Config } from "./config.ts";
-import { object, objects, type JsonObject } from "./json.ts";
+import { object, type JsonObject } from "./json.ts";
 import {
   BOUNDARY_TYPE,
   CHECKPOINT_TYPE,
   TEMPLATE_TYPE,
   checkpoint,
   eligibleModel,
-  enforceThinking,
   parseSummary,
   replay,
+  summaryPayload,
   template,
 } from "./protocol.ts";
 import { registerSettings } from "./settings.ts";
-import {
-  REQUEST_TYPE,
-  bindingTemplate,
-  fingerprint,
-  messageHash,
-  prepareRetained,
-  requestBoundary,
-  selectTail,
-  type RetainedHistory,
-} from "./tail.ts";
 
-const anthropic = anthropicMessagesApi();
-
-async function prepareRequest(
-  model: Model<"anthropic-messages">,
-  context: TranscriptContext,
-  options: SimpleStreamOptions,
-): Promise<Request> {
-  let prepared: Request | undefined;
-  await anthropic
-    .streamSimple(model, context, {
-      ...options,
-      maxRetries: 0,
-      fetch: (input, init) => {
-        prepared = new Request(input, init);
-        return Promise.reject(new Error("Native request prepared without transmission."));
-      },
-    })
-    .result();
-  options.signal?.throwIfAborted();
-  if (!prepared) throw new Error("Could not serialize the Anthropic compaction request.");
-  return prepared;
-}
-
-function anthropicModel(model: Model<Api>): model is Model<"anthropic-messages"> {
-  return model.api === "anthropic-messages";
-}
+// This fork never replaces the `anthropic` provider. Another extension (for example
+// pi-black) may own it. Replay happens in `before_provider_request`, which Pi runs
+// inside the provider's `onPayload` chain before provider-specific transforms and
+// before the request body is serialized. Summary requests go through
+// `ctx.modelRegistry.streamSimple`, so they pass through the registered provider too.
 
 export function requireCompletedTools(messages: readonly Message[]): void {
   const pending = new Set<string>();
@@ -82,19 +40,6 @@ export function requireCompletedTools(messages: readonly Message[]): void {
     }
   }
   if (pending.size > 0) throw new Error("Resolve pending tool calls before native compaction.");
-}
-
-/**
- * The transcript Pi rebuilds after compaction: its snapshot of the current prompt and
- * tools leads, followed by the retained messages. Serializing this shape, rather than
- * the retained messages alone, proves the tail survives the compaction entry unchanged.
- */
-export function compactedTranscript(
-  whole: readonly Message[],
-  kept: readonly Message[],
-): TranscriptContext {
-  const snapshot = getCurrentSystemMessage(whole);
-  return normalizeContext({ messages: snapshot ? [snapshot, ...kept] : [...kept] });
 }
 
 export function activeCheckpoint(entries: readonly SessionEntry[]) {
@@ -118,83 +63,51 @@ export function activeTemplate(
   return undefined;
 }
 
-export function registerCompatibility(pi: ExtensionAPI, fetcher = fetch): void {
-  let context: ExtensionContext | undefined;
+class SummaryCaptured extends Error {
+  constructor() {
+    super("Native summary captured.");
+  }
+}
+
+export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = fetch): void {
   let config: Config | undefined;
-  let transform: SimpleStreamOptions["onPayload"];
-  let transformModel: string | undefined;
 
   const configuration = (ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted">): Config => {
     config ??= loadConfig(ctx.cwd, ctx.isProjectTrusted()).config;
     return config;
   };
   const reset = () => {
-    context = undefined;
     config = undefined;
-    transform = undefined;
-    transformModel = undefined;
   };
-  pi.on("session_start", (_event, ctx) => {
-    reset();
-    context = ctx;
-  });
+  pi.on("session_start", reset);
   pi.on("session_shutdown", reset);
-  pi.on("session_tree", (_event, ctx) => {
-    reset();
-    context = ctx;
-  });
-  pi.on("model_select", (_event, ctx) => {
-    context = ctx;
-    transform = undefined;
-    transformModel = undefined;
-  });
-  // The full-transcript event returns messages verbatim. A changed `context`
-  // result on Pi 0.87 folds every later system message into the leading one,
-  // which changes the serialized `system` template after a checkpoint and
-  // breaks retained-history replay.
+
+  // Once a signed checkpoint exists, it replaces Pi's readable summary on the wire.
   pi.on("context_with_system", (event, ctx) => {
-    context = ctx;
     if (!eligibleModel(ctx.model) || !activeCheckpoint(ctx.sessionManager.getBranch())) return;
     return { messages: event.messages.filter((message) => message.role !== "compactionSummary") };
   });
 
-  pi.registerProvider("anthropic", {
-    api: "anthropic-messages",
-    streamSimple: (model, messages, options) => {
-      if (!anthropicModel(model)) throw new Error("Expected Anthropic Messages API.");
-      return anthropic.streamSimple(model, messages, {
-        ...options,
-        onPayload: async (payload, selected) => {
-          const updated = await options?.onPayload?.(payload, selected);
-          const transformed = object(updated === undefined ? payload : updated);
-          const ctx = context;
-          if (!ctx || !eligibleModel(model)) return transformed;
-          // One-off summaries and other extensions' nested calls are not agent turns.
-          if (options?.sessionId !== ctx.sessionManager.getSessionId()) return transformed;
-          transform = options?.onPayload;
-          transformModel = model.id;
-          const branch = ctx.sessionManager.getBranch();
-          const nextTemplate = template(transformed);
-          if (JSON.stringify(activeTemplate(branch, model.id)) !== JSON.stringify(nextTemplate)) {
-            pi.appendEntry(TEMPLATE_TYPE, nextTemplate);
-          }
-          const current = configuration(ctx);
-          const final = replay(
-            current.enabled && current.keepRecentTokens > 0
-              ? enforceThinking(transformed)
-              : transformed,
-            activeCheckpoint(branch),
-          );
-          const anchor = ctx.sessionManager.getLeafId();
-          if (anchor) pi.appendEntry(REQUEST_TYPE, requestBoundary(final, anchor));
-          return final;
-        },
-      });
-    },
+  pi.on("before_provider_request", (event, ctx) => {
+    const model = ctx.model;
+    if (!eligibleModel(model)) return undefined;
+    const payload = event.payload;
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return undefined;
+    const request = object(payload);
+    // Ignore requests for other models, such as nested calls by other extensions.
+    if (request["model"] !== model.id) return undefined;
+    const branch = ctx.sessionManager.getBranch();
+    if (configuration(ctx).enabled) {
+      const next = template(request);
+      if (JSON.stringify(activeTemplate(branch, model.id)) !== JSON.stringify(next)) {
+        pi.appendEntry(TEMPLATE_TYPE, next);
+      }
+    }
+    const saved = activeCheckpoint(branch);
+    return saved ? replay(request, saved) : undefined;
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
-    context = ctx;
     if (!eligibleModel(ctx.model)) return;
     try {
       if (!configuration(ctx).enabled) return;
@@ -204,120 +117,73 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher = fetch): void {
       const branch = ctx.sessionManager.getBranch();
       const saved = activeCheckpoint(branch);
       const savedTemplate = activeTemplate(branch, model.id);
-      const currentTransform = transformModel === model.id ? transform : undefined;
       if (!savedTemplate) {
         throw new Error(
           "Run an Anthropic turn before compacting so final system instructions and tools can be captured.",
         );
       }
-      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-      if (!auth.ok) throw new Error("Anthropic authentication is unavailable.");
-      const requestModel = { ...model, baseUrl: auth.baseUrl ?? model.baseUrl };
-      if (!eligibleModel(requestModel))
-        throw new Error("Native compaction requires the direct Claude API.");
       const signal = AbortSignal.any([
         event.signal,
         AbortSignal.timeout(configuration(ctx).timeoutSeconds * 1000),
       ]);
       signal.throwIfAborted();
-      // Prompt and tool declarations travel as system messages inside the transcript.
       const active = buildSessionContext(branch, leaf).messages;
       const messages = convertToLlm(
         saved ? active.filter((message) => message.role !== "compactionSummary") : active,
       );
       requireCompletedTools(messages);
+      const maxTokens = Math.min(configuration(ctx).maxSummaryTokens, model.maxTokens);
       const level = pi.getThinkingLevel();
-      const serializationOptions: SimpleStreamOptions = {
-        ...auth,
+
+      let response: JsonObject | undefined;
+      let unsupported = false;
+      const options: SimpleStreamOptions = {
         signal,
+        sessionId: session,
+        maxRetries: 0,
+        maxTokens,
         ...(level === "off" ? {} : { reasoning: level }),
-        maxTokens: Math.min(configuration(ctx).maxSummaryTokens, model.maxTokens),
-        onPayload: async (payload, selected) => {
-          const updated = await currentTransform?.(payload, selected);
-          const result = object(updated === undefined ? payload : updated);
-          if (!currentTransform) {
-            for (const key of ["system", "tools", "thinking", "output_config"] as const) {
-              if (savedTemplate[key] === undefined) delete result[key];
-              else result[key] = savedTemplate[key];
-            }
+        // Runs before the registered provider's own payload transform (for example
+        // pi-black's Claude Code system blocks), so they still apply afterward.
+        onPayload: (payload) => {
+          const result = object(payload);
+          for (const key of ["system", "tools", "thinking", "output_config"] as const) {
+            if (savedTemplate[key] === undefined) delete result[key];
+            else result[key] = savedTemplate[key];
           }
-          return configuration(ctx).keepRecentTokens > 0 ? enforceThinking(result) : result;
+          const replayed = replay(result, saved);
+          if (replayed["model"] !== model.id) {
+            throw new Error("A provider transform changed the summary model.");
+          }
+          return summaryPayload(replayed, maxTokens, event.customInstructions);
+        },
+        // The registered provider's fetch wrapper (for example pi-black's cch patch)
+        // calls this transport last, with the final headers and body.
+        fetch: async (input, init) => {
+          const request = new Request(input, init);
+          if (!(await supportsCompaction(request, model.id, signal, fetcher))) {
+            unsupported = true;
+          } else {
+            response = await sendSummaryRequest(request, signal, fetcher);
+          }
+          throw new SummaryCaptured();
         },
       };
-      // Serialize without transmission, then select only a proven earlier request.
-      const whole = await prepareRequest(
-        requestModel,
-        normalizeContext({ messages }),
-        serializationOptions,
-      );
-      const wholePayload = replay(object(await whole.clone().json()), saved);
-      if (wholePayload["model"] !== model.id) {
-        throw new Error("A provider transform changed the summary model. History was preserved.");
-      }
-      const keepRecentTokens = configuration(ctx).keepRecentTokens;
-      const managedEffort = model.compat?.supportsMidConvoEffort === true;
-      const selection =
-        keepRecentTokens > 0
-          ? selectTail(branch, leaf, wholePayload, keepRecentTokens, managedEffort)
-          : undefined;
-      let retained: RetainedHistory | undefined;
-      if (selection) {
-        const keptMessages = convertToLlm(selection.keptMessages);
-        requireCompletedTools(keptMessages);
-        const tailRequest = await prepareRequest(
-          requestModel,
-          compactedTranscript(messages, keptMessages),
-          serializationOptions,
-        );
-        retained = prepareRetained(
-          selection.tail,
-          object(await tailRequest.json()),
-          selection.template,
-          selection.prefix.at(-1),
-          managedEffort,
-        );
-      }
-      const prepared = new Request(whole.url, {
-        method: "POST",
-        headers: whole.headers,
-        body: JSON.stringify(
-          selection ? { ...wholePayload, messages: selection.prefix } : wholePayload,
-        ),
-      });
-      if (!(await supportsCompaction(prepared, model.id, signal, fetcher))) {
+      const result = await ctx.modelRegistry
+        .streamSimple(model, normalizeContext({ messages }), options)
+        .result();
+      signal.throwIfAborted();
+      if (unsupported) {
         ctx.ui.notify(
           "This model does not support native compaction. Pi compaction remains available.",
           "warning",
         );
         return;
       }
-      const raw = await compactRequest(
-        prepared,
-        Math.min(configuration(ctx).maxSummaryTokens, model.maxTokens),
-        signal,
-        event.customInstructions,
-        fetcher,
-      );
-      const result = parseSummary(raw, model);
-      signal.throwIfAborted();
-      if (selection) {
-        const verification = await prepareRequest(
-          requestModel,
-          normalizeContext({ messages }),
-          serializationOptions,
-        );
-        const verifiedPayload = replay(object(await verification.json()), saved);
-        if (
-          fingerprint(bindingTemplate(verifiedPayload)) !==
-            fingerprint(bindingTemplate(wholePayload)) ||
-          messageHash(objects(verifiedPayload["messages"])) !==
-            messageHash(objects(wholePayload["messages"]))
-        ) {
-          throw new Error(
-            "System, tools, or history changed during compaction. The summary was not applied.",
-          );
-        }
+      if (!response) {
+        throw new Error(result.errorMessage ?? "Could not send the Anthropic compaction request.");
       }
+      const summary = parseSummary(response, model);
       if (
         ctx.sessionManager.getSessionId() !== session ||
         ctx.sessionManager.getLeafId() !== leaf ||
@@ -325,24 +191,16 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher = fetch): void {
       ) {
         throw new Error("The session changed during compaction. The summary was not applied.");
       }
-      // Full-history mode needs an empty boundary. Keep-tail mode points to the
-      // original first retained entry. Neither mode deletes historical entries.
-      if (!selection) pi.appendEntry(BOUNDARY_TYPE, { version: 1 });
-      const boundary = selection?.firstKeptEntryId ?? ctx.sessionManager.getLeafId();
+      pi.appendEntry(BOUNDARY_TYPE, { version: 1 });
+      const boundary = ctx.sessionManager.getLeafId();
       if (!boundary) throw new Error("Could not record the compaction boundary.");
       return {
         compaction: {
-          summary: result.summary,
+          summary: summary.summary,
           firstKeptEntryId: boundary,
           tokensBefore: event.preparation.tokensBefore,
-          usage: result.usage,
-          details: {
-            type: CHECKPOINT_TYPE,
-            version: 1,
-            model: model.id,
-            block: result.block,
-            ...(retained ? { retained } : {}),
-          },
+          usage: summary.usage,
+          details: { type: CHECKPOINT_TYPE, version: 1, model: model.id, block: summary.block },
         },
       };
     } catch (error) {

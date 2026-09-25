@@ -20,18 +20,16 @@ test("configuration defaults are opt-in and reject invalid ranges", () => {
     { maxSummaryTokens: 0 },
     { timeoutSeconds: 601 },
     { maxSummaryTokens: 1.5 },
-    { keepRecentTokens: -1 },
-    { keepRecentTokens: 200001 },
-    { keepRecentTokens: 1.5 },
+    { maxSummaryTokens: 1023 },
+    { maxSummaryTokens: 32769 },
+    { maxSummaryTokens: 1.5 },
   ]) {
     assert.throws(() => parseConfig(data));
   }
   assert.equal(settingPatch("enabled", "on", DEFAULT_CONFIG).enabled, true);
   assert.throws(() => settingPatch("other", "on", DEFAULT_CONFIG), /Unknown/);
-  assert.equal(DEFAULT_CONFIG.keepRecentTokens, 0);
-  assert.equal(settingPatch("keepRecentTokens", "16000", DEFAULT_CONFIG).keepRecentTokens, 16000);
-  assert.equal(parseConfig({ keepRecentTokens: 200000 }).keepRecentTokens, 200000);
-  assert.equal(settingItems(DEFAULT_CONFIG).length, 4);
+  assert.equal(settingPatch("maxSummaryTokens", "8192", DEFAULT_CONFIG).maxSummaryTokens, 8192);
+  assert.equal(settingItems(DEFAULT_CONFIG).length, 3);
 });
 
 test("trusted project overrides, global defaults, unknown-key preservation, and concurrent edit protection", async () => {
