@@ -146,6 +146,8 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
 
       let response: JsonObject | undefined;
       let unsupported = false;
+      // The SDK reports any transport exception as "Connection error.", so keep the cause.
+      let failure: unknown;
       const options: SimpleStreamOptions = {
         signal,
         sessionId: session,
@@ -169,11 +171,15 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
         // The registered provider's fetch wrapper (for example pi-black's cch patch)
         // calls this transport last, with the final headers and body.
         fetch: async (input, init) => {
-          const request = new Request(input, init);
-          if (!(await supportsCompaction(request, model.id, signal, fetcher))) {
-            unsupported = true;
-          } else {
-            response = await sendSummaryRequest(request, signal, fetcher);
+          try {
+            const request = new Request(input, init);
+            if (!(await supportsCompaction(request, model.id, signal, fetcher))) {
+              unsupported = true;
+            } else {
+              response = await sendSummaryRequest(request, signal, fetcher);
+            }
+          } catch (error) {
+            failure = error;
           }
           throw new SummaryCaptured();
         },
@@ -189,6 +195,8 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
         );
         return;
       }
+      if (failure)
+        throw failure instanceof Error ? failure : new Error("Native compaction transport failed.");
       if (!response) {
         throw new Error(result.errorMessage ?? "Could not send the Anthropic compaction request.");
       }

@@ -10,7 +10,11 @@ import {
   summaryPayload,
 } from "../extensions/anthropic-compat/protocol.ts";
 import { object, objects } from "../extensions/anthropic-compat/json.ts";
-import { sendSummaryRequest, supportsCompaction } from "../extensions/anthropic-compat/client.ts";
+import {
+  collectStream,
+  sendSummaryRequest,
+  supportsCompaction,
+} from "../extensions/anthropic-compat/client.ts";
 import { block, model, summaryResponse } from "./fixtures.ts";
 import { requireCompletedTools } from "../extensions/anthropic-compat/runtime.ts";
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
@@ -198,4 +202,33 @@ test("malformed successful provider responses never expose raw response bodies",
     ),
     { message: "Anthropic returned an invalid JSON response. History was preserved." },
   );
+});
+
+test("streamed summaries are rebuilt into the non-streaming response shape", () => {
+  const events = [
+    { type: "message_start", message: { model: model.id, content: [], stop_reason: null } },
+    {
+      type: "content_block_start",
+      index: 0,
+      content_block: { ...block, content: "The synthetic " },
+    },
+    { type: "ping" },
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "compaction_delta", content: "project is Lantern." },
+    },
+    { type: "content_block_stop", index: 0 },
+    {
+      type: "message_delta",
+      delta: { stop_reason: "compaction" },
+      usage: object(summaryResponse()["usage"]),
+    },
+    { type: "message_stop" },
+  ];
+  const text = events
+    .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+    .join("");
+  assert.deepEqual(parseSummary(collectStream(text), model).block, block);
+  assert.throws(() => collectStream('data: {"type":"error"}\n'), /streaming error/);
 });
