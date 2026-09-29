@@ -33,7 +33,8 @@ validated against Pi 0.87.1. Opus 5.5 requires Pi 0.87.1's model catalog.
 pi install git:github.com/aliceisjustplaying/pi-anthropic-compat
 ```
 
-Native compaction starts **off**. Open `/anthropic-settings` and enable it.
+Native compaction starts **off**. Open `/anthropic-settings`, enable it, and
+press **Ctrl+S** to save and apply.
 Use your existing Anthropic API key or Claude subscription login in Pi.
 The extension does not manage a separate credential store.
 
@@ -114,11 +115,22 @@ provider error bodies. Treat session files as private conversation data.
 
 `/anthropic-settings` provides a searchable settings list:
 
-- **Space** changes a value.
-- Changes apply to the current session immediately.
-- **Ctrl+S** saves without closing.
-- **Enter** saves and closes.
-- **Escape** discards changes since opening or the last successful save.
+- **Enter** changes the selected value or opens its editor. It never implicitly saves.
+- **Space** activates a result or inserts a space when search has focus.
+- **Tab / Shift+Tab** move between search, results, and action controls.
+- **F1** opens scrollable details, full errors, and the exact save target.
+- Edits remain drafts until explicitly applied or saved.
+- **Apply to session** applies drafts without writing configuration files and stays open.
+- **Ctrl+S** saves and applies changes without closing.
+- **Save and close** saves and applies changes, then closes on success.
+- **Escape** cancels a field editor or discards unapplied drafts and closes the main menu.
+  It does not undo settings already applied to the session.
+
+Search matches labels, configuration keys, and descriptions. Numeric editors
+offer presets and custom values across the complete supported range.
+**Use inherited value** removes the selected override rather than copying its
+current default into the file. Rows show their configuration source.
+Pi's remapped selection and cancel keys are respected.
 
 Settings are stored in `~/.pi/agent/pi-anthropic-compat.json`.
 `PI_CODING_AGENT_DIR` changes that directory.
@@ -142,8 +154,30 @@ The menu saves to that file when it already exists. Otherwise it saves globally.
 Untrusted project configuration is ignored. Invalid configuration produces an
 error instead of silently enabling native compaction.
 
-Saving preserves unknown configuration keys and detects file changes made
-since the menu opened. Reopen the menu after a concurrent configuration edit.
+Saving changes only edited overrides and preserves unknown keys and inherited
+values. The save target stays fixed while the menu is open. Non-conflicting
+external edits are preserved; conflicting edits are rejected for review.
+Opening or closing without changes does not create a configuration file.
+Reopening shows active session values, not freshly read file values. `*` marks
+an unapplied draft. `~` marks an active session override or a value that differs
+from the saved configuration. Details shows the saved value when it differs.
+Ctrl+S also persists changes previously applied only to the session.
+Session settings are stored as extension state entries in the Pi session,
+outside model context. They survive menu closure, tree navigation, extension
+reload, process restart, and switching away and back. Resuming the same session
+restores its settings before provider operations. A new session, fork, or clone
+has a separate identity and starts from configuration files.
+Pi's `--no-session` mode cannot be resumed after exit. Pi also defers creating a
+new session file until its first assistant message.
+
+Applying and saving wait for Pi to become idle. Escape cancels a pending operation
+without discarding the draft. Failures leave the menu open. If a save reaches disk
+but cannot be applied to the session, the menu reports that distinction and
+Ctrl+S retries application. Cooperating writers use a `.settings-lock` file.
+An interrupted writer can leave a lock that requires review; locks are not
+automatically deleted. External editors do not participate in that lock.
+Session overrides retain their original conflict checks across menu reopenings.
+Conflicting external edits remain protected after reload or restart.
 
 The menu requires TUI mode. File configuration also works in print and RPC
 modes. `/compact <instructions>` supplies additional summary guidance.

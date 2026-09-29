@@ -22,6 +22,9 @@ import {
 } from "../extensions/anthropic-compat/runtime.ts";
 import { object, objects, type JsonObject } from "../extensions/anthropic-compat/json.ts";
 import { block, model, summaryResponse, textResponse } from "./fixtures.ts";
+import { SESSION_SETTINGS_TYPE } from "../extensions/anthropic-compat/settings.ts";
+import { DEFAULT_CONFIG } from "../extensions/anthropic-compat/config.ts";
+import { sessionSettingsEntry } from "../extensions/settings-session.ts";
 
 const BILLING = "x-anthropic-billing-header: cc_version=test; cch=00000;";
 
@@ -193,6 +196,7 @@ async function setup(
   const session = await create();
   return {
     session,
+    configFile: join(agentDir, "pi-anthropic-compat.json"),
     manager,
     requests,
     headers,
@@ -208,6 +212,49 @@ async function setup(
     },
   };
 }
+
+test("native compaction restores session configuration before requests after reload and resume", async (t) => {
+  const { session, manager, create, requests } = await setup(t, {
+    enabled: false,
+    persistent: true,
+  });
+  await session.prompt("Remember the synthetic project Lantern.");
+  manager.appendCustomEntry(
+    SESSION_SETTINGS_TYPE,
+    sessionSettingsEntry(
+      manager.getSessionId(),
+      { ...DEFAULT_CONFIG, enabled: true },
+      { changes: {} },
+      {},
+    ),
+  );
+  await session.reload();
+  // This fork records request templates only while native compaction is on.
+  await session.prompt("Record a template now that native compaction is on.");
+  await session.compact();
+  assert.ok(requests.at(-1)?.["compaction"]);
+  const file = manager.getSessionFile();
+  assert.ok(file);
+  const resumed = await create(SessionManager.open(file));
+  await resumed.prompt("Continue after resume.");
+  await resumed.compact();
+  assert.ok(requests.at(-1)?.["compaction"]);
+});
+
+test("tree navigation retains active session configuration instead of reloading files", async (t) => {
+  const { session, manager, requests, configFile } = await setup(t);
+  await session.prompt("Remember the synthetic project Lantern.");
+  const user = manager
+    .getBranch()
+    .find((entry) => entry.type === "message" && entry.message.role === "user");
+  assert.ok(user);
+  await writeFile(configFile, JSON.stringify({ enabled: false }));
+  await session.navigateTree(user.id);
+  await session.prompt("Continue on this branch.");
+  const result = await session.compact();
+  assert.equal(result.summary, block["content"]);
+  assert.ok(requests.some((request) => request["compaction"]));
+});
 
 test("real Pi session compacts, replays exactly one native block, and retains original history", async (t) => {
   const { session, manager, requests } = await setup(t);

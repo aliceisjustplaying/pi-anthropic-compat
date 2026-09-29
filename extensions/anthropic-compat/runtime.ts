@@ -7,7 +7,7 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { sendSummaryRequest, supportsCompaction } from "./client.ts";
-import { loadConfig, type Config } from "./config.ts";
+import type { Config } from "./config.ts";
 import { object, type JsonObject } from "./json.ts";
 import {
   CHECKPOINT_TYPE,
@@ -19,7 +19,7 @@ import {
   summaryPayload,
   template,
 } from "./protocol.ts";
-import { registerSettings } from "./settings.ts";
+import { loadSessionConfig, registerSettings } from "./settings.ts";
 
 // This fork never replaces the `anthropic` provider. Another extension (for example
 // pi-black) may own it. Replay happens in `before_provider_request`, which Pi runs
@@ -71,8 +71,8 @@ class SummaryCaptured extends Error {
 export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = fetch): void {
   let config: Config | undefined;
 
-  const configuration = (ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted">): Config => {
-    config ??= loadConfig(ctx.cwd, ctx.isProjectTrusted()).config;
+  const configuration = (ctx: Parameters<typeof loadSessionConfig>[0]): Config => {
+    config ??= loadSessionConfig(ctx);
     return config;
   };
   const reset = () => {

@@ -8,4 +8,7 @@ extensions/anthropic-compat/protocol.ts
 extensions/anthropic-compat/runtime.ts
 extensions/anthropic-compat/settings.ts
 extensions/index.ts
+extensions/settings-menu.ts
+extensions/settings-session.ts
+extensions/settings-store.ts
 package.json
