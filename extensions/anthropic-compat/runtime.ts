@@ -2,16 +2,13 @@ import {
   getCurrentSystemMessage,
   getCurrentTools,
   normalizeContext,
-  type Api,
   type Message,
-  type Model,
   type SimpleStreamOptions,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import {
   convertToLlm,
   type ExtensionAPI,
-  type ExtensionContext,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { sendSummaryRequest, supportsCompaction } from "./client.ts";

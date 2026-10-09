@@ -463,7 +463,7 @@ test("emulated keep-tail summarizes older turns and replays recent ones verbatim
 for (const codemode of ["on", "only"] as const) {
   for (const keepRecentTokens of [0, 1]) {
     test(`native compaction declares the turn tools under codemode ${codemode} mode with keepRecentTokens=${keepRecentTokens}`, async (t) => {
-      const { session, requests } = await setup(t, { codemode, keepRecentTokens });
+      const { session, requests } = await setup(t, { codemode, keep: keepRecentTokens });
       await session.prompt("Remember the synthetic project Lantern.");
       await session.prompt("Remember the synthetic city Harbor.");
       const turn = requests.at(-1);
@@ -488,7 +488,7 @@ for (const keepRecentTokens of [0, 1]) {
   test(`codemode only mode keeps a direct tool added mid-session out of summaries with keepRecentTokens=${keepRecentTokens}`, async (t) => {
     const { session, requests } = await setup(t, {
       codemode: "only",
-      keepRecentTokens,
+      keep: keepRecentTokens,
       modelId: "claude-opus-5-5",
       managed: true,
     });
