@@ -1,14 +1,22 @@
-import { normalizeContext, type Message, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import {
+  getCurrentSystemMessage,
+  getCurrentTools,
+  normalizeContext,
+  type Api,
+  type Message,
+  type Model,
+  type SimpleStreamOptions,
+  type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import {
   convertToLlm,
-  buildSessionContext,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { sendSummaryRequest, supportsCompaction } from "./client.ts";
 import type { Config } from "./config.ts";
-import { object, type JsonObject } from "./json.ts";
+import { object, objects, type JsonObject } from "./json.ts";
 import {
   CHECKPOINT_TYPE,
   TEMPLATE_TYPE,
@@ -41,6 +49,57 @@ export function requireCompletedTools(messages: readonly Message[]): void {
   if (pending.size > 0) throw new Error("Resolve pending tool calls before native compaction.");
 }
 
+/**
+ * Current transcript tools the last turn request did not send. Pi hides them
+ * from requests in codemode `only` mode. Pi hides only current tools, and a
+ * tool a turn removed is no longer current. Names compare case-insensitively,
+ * because OAuth requests send Claude Code's capitalized names for Pi's tools.
+ */
+export function hiddenTools(
+  messages: readonly Message[],
+  savedTemplate: JsonObject,
+): ReadonlySet<string> {
+  const tools = savedTemplate["tools"];
+  const sent = new Set(
+    (Array.isArray(tools) ? objects(tools) : []).flatMap((tool) =>
+      typeof tool["name"] === "string" ? [tool["name"].toLowerCase()] : [],
+    ),
+  );
+  return new Set(
+    getCurrentTools([...messages])
+      .map((tool) => tool.name)
+      .filter((name) => !sent.has(name.toLowerCase())),
+  );
+}
+
+/** Remove hidden tools from every tool declaration change, as Pi projects requests. */
+export function withoutHiddenTools(
+  messages: readonly Message[],
+  hidden: ReadonlySet<string>,
+): Message[] {
+  if (hidden.size === 0) return [...messages];
+  return messages.map((message) => {
+    if (message.role !== "system" || (!message.toolsAdded && !message.toolsRemoved)) {
+      return message;
+    }
+    const { toolsAdded, toolsRemoved, ...rest } = message;
+    const added = toolsAdded?.filter((tool) => !hidden.has(tool.name)) ?? [];
+    const removed = toolsRemoved?.filter((tool) => !hidden.has(tool.name)) ?? [];
+    return {
+      ...rest,
+      ...(added.length > 0 ? { toolsAdded: added } : {}),
+      ...(removed.length > 0 ? { toolsRemoved: removed } : {}),
+    };
+  });
+}
+
+export function compactedTranscript(
+  whole: readonly Message[],
+  kept: readonly Message[],
+): TranscriptContext {
+  const snapshot = getCurrentSystemMessage(whole);
+  return normalizeContext({ messages: snapshot ? [snapshot, ...kept] : [...kept] });
+}
 export function activeCheckpoint(entries: readonly SessionEntry[]) {
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
@@ -126,21 +185,24 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
         AbortSignal.timeout(configuration(ctx).timeoutSeconds * 1000),
       ]);
       signal.throwIfAborted();
-      requireCompletedTools(convertToLlm(buildSessionContext(branch, leaf).messages));
       // Emulated keep-tail: summarize only what Pi's own split (compaction.keepRecentTokens)
       // discards. Pi keeps entries from firstKeptEntryId verbatim after the summary.
       // Signed thinking in kept messages no longer matches its original prefix, so
       // Anthropic drops it by default; no prefix_mismatch_behavior is requested.
       const { preparation } = event;
-      const messages = convertToLlm(
+      const transcript = convertToLlm(
         [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages].filter(
           (message) => message.role !== "compactionSummary",
         ),
       );
+      // Pi leaves tools it hides (codemode `only` mode) out of every request
+      // after extensions see the transcript. The saved template lists the tools
+      // the last turn sent, so the others are removed here as Pi removes them.
+      const hidden = hiddenTools(transcript, savedTemplate);
+      const messages = withoutHiddenTools(transcript, hidden);
       if (!messages.some((message) => message.role === "user" || message.role === "assistant")) {
         throw new Error("Nothing to summarize before the kept messages.");
       }
-      requireCompletedTools(messages);
       const maxTokens = Math.min(configuration(ctx).maxSummaryTokens, model.maxTokens);
       const level = pi.getThinkingLevel();
 

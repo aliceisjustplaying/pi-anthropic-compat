@@ -5,12 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createAgentSession,
+  createCodemodeExtension,
+  defineTool,
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, Type, type Message } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
@@ -19,6 +21,8 @@ import {
   registerCompatibility,
   activeCheckpoint,
   activeTemplate,
+  hiddenTools,
+  withoutHiddenTools,
 } from "../extensions/anthropic-compat/runtime.ts";
 import { object, objects, type JsonObject } from "../extensions/anthropic-compat/json.ts";
 import { block, model, summaryResponse, textResponse } from "./fixtures.ts";
@@ -59,6 +63,23 @@ function fakeBlack(pi: ExtensionAPI): void {
   });
 }
 
+const execute = async () => ({ content: [{ type: "text" as const, text: "ok" }], details: {} });
+const reportTool = defineTool({
+  name: "report",
+  label: "Report",
+  description: "Report a value.",
+  parameters: Type.Object({ value: Type.String() }),
+  execute,
+});
+const handoffTool = defineTool({
+  name: "handoff",
+  label: "Handoff",
+  description: "Hand off the session.",
+  parameters: Type.Object({ goal: Type.String() }),
+  exposure: "model-only",
+  execute,
+});
+
 async function setup(
   t: TestContext,
   options: {
@@ -71,9 +92,11 @@ async function setup(
     /** Pi's compaction.keepRecentTokens. */
     keep?: number;
     managed?: boolean;
-    modelId?: "claude-opus-5-5";
+    modelId?: "claude-opus-5-5" | "claude-haiku-5-5";
     /** Replace the serialized system prompt at the payload boundary. Default: true. */
     patchSystem?: boolean;
+    /** Activate Pi codemode in this mode next to a direct and a model-only tool. */
+    codemode?: "on" | "only";
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "anthropic-integration-"));
@@ -147,6 +170,7 @@ async function setup(
         reserveTokens: 16384,
       },
       retry: { enabled: false, provider: { maxRetries: 0 } },
+      ...(options.codemode ? { codemode: { mode: options.codemode } } : {}),
     });
     const loader = new DefaultResourceLoader({
       cwd: root,
@@ -173,6 +197,7 @@ async function setup(
           pi.on("before_agent_start", (event) => {
             if (section !== undefined) event.systemPromptOptions.sections["fixture"] = section;
           }),
+        ...(options.codemode ? [createCodemodeExtension()] : []),
       ],
     });
     await loader.reload();
@@ -186,9 +211,12 @@ async function setup(
       sessionManager,
       settingsManager: settings,
       resourceLoader: loader,
-      noTools: "all",
+      ...(options.codemode
+        ? { noTools: "builtin" as const, customTools: [reportTool, handoffTool] }
+        : { noTools: "all" as const }),
     });
     await session.bindExtensions({});
+    if (options.codemode) session.setActiveToolsByName(["report", "handoff", "codemode"]);
     contextWindow = session.model?.contextWindow ?? model.contextWindow;
     t.after(() => session.dispose());
     return session;
@@ -293,20 +321,22 @@ test("real Pi session compacts, replays exactly one native block, and retains or
   assert.deepEqual(objects(repeated["messages"])[0], { role: "assistant", content: [block] });
 });
 
-test("Opus 5.5 compacts and replays", async (t) => {
-  const { session, manager, requests } = await setup(t, {
-    modelId: "claude-opus-5-5",
-    managed: true,
+for (const modelId of ["claude-opus-5-5", "claude-haiku-5-5"] as const) {
+  test(`${modelId} compacts and replays`, async (t) => {
+    const { session, manager, requests } = await setup(t, {
+      modelId,
+      managed: true,
+    });
+    await session.prompt("Remember the synthetic project Lantern.");
+    await session.compact();
+    assert.equal(activeCheckpoint(manager.getBranch())?.model, modelId);
+    await session.prompt("Continue.");
+    const latest = requests.at(-1);
+    assert.ok(latest);
+    assert.equal(latest["model"], modelId);
+    assert.deepEqual(objects(latest["messages"])[0], { role: "assistant", content: [block] });
   });
-  await session.prompt("Remember the synthetic project Lantern.");
-  await session.compact();
-  assert.equal(activeCheckpoint(manager.getBranch())?.model, "claude-opus-5-5");
-  await session.prompt("Continue.");
-  const latest = requests.at(-1);
-  assert.ok(latest);
-  assert.equal(latest["model"], "claude-opus-5-5");
-  assert.deepEqual(objects(latest["messages"])[0], { role: "assistant", content: [block] });
-});
+}
 
 test("native replay and manual compaction survive extension reload and branch navigation", async (t) => {
   const { session, manager, requests, create } = await setup(t, { persistent: true });
@@ -428,4 +458,89 @@ test("emulated keep-tail summarizes older turns and replays recent ones verbatim
   assert.deepEqual(messages[0], { role: "assistant", content: [block] });
   assert.match(JSON.stringify(messages), /Recent turn about Beacon/);
   assert.doesNotMatch(JSON.stringify(messages), /Old turn about/);
+});
+
+for (const codemode of ["on", "only"] as const) {
+  for (const keepRecentTokens of [0, 1]) {
+    test(`native compaction declares the turn tools under codemode ${codemode} mode with keepRecentTokens=${keepRecentTokens}`, async (t) => {
+      const { session, requests } = await setup(t, { codemode, keepRecentTokens });
+      await session.prompt("Remember the synthetic project Lantern.");
+      await session.prompt("Remember the synthetic city Harbor.");
+      const turn = requests.at(-1);
+      assert.ok(turn);
+      const names = objects(turn["tools"]).map((tool) => tool["name"]);
+      assert.deepEqual(names.includes("report"), codemode === "on");
+      assert.ok(names.includes("codemode") && names.includes("handoff"));
+      await session.compact();
+      const summary = requests.at(-1);
+      assert.ok(summary?.["compaction"]);
+      assert.deepEqual(summary["tools"], turn["tools"]);
+      await session.prompt("Continue.");
+      const continued = requests.at(-1);
+      assert.ok(continued && !continued["compaction"]);
+      assert.deepEqual(continued["tools"], turn["tools"]);
+      assert.match(JSON.stringify(continued["messages"]), /test-opaque-content/);
+    });
+  }
+}
+
+for (const keepRecentTokens of [0, 1]) {
+  test(`codemode only mode keeps a direct tool added mid-session out of summaries with keepRecentTokens=${keepRecentTokens}`, async (t) => {
+    const { session, requests } = await setup(t, {
+      codemode: "only",
+      keepRecentTokens,
+      modelId: "claude-opus-5-5",
+      managed: true,
+    });
+    session.setActiveToolsByName(["handoff", "codemode"]);
+    await session.prompt("Remember the synthetic project Lantern.");
+    // A later system message declares `report`; Pi hides it from requests.
+    session.setActiveToolsByName(["report", "handoff", "codemode"]);
+    await session.prompt("Remember the synthetic city Harbor.");
+    const turn = requests.at(-1);
+    assert.ok(turn && !turn["compaction"]);
+    assert.doesNotMatch(JSON.stringify(turn), /"report"/);
+    const summaries = () => requests.filter((request) => request["compaction"]);
+    // This fork emulates keep-tail with Pi's own split, so a tool change does
+    // not cancel compaction; the summary request must exclude the hidden tool
+    // for both split sizes.
+    await session.compact();
+    const summary = summaries().at(-1);
+    assert.ok(summary);
+    assert.deepEqual(summary["tools"], turn["tools"]);
+    assert.doesNotMatch(JSON.stringify(summary), /"report"/);
+    await session.prompt("Continue.");
+    const last = session.messages.at(-1);
+    assert.ok(last?.role === "assistant" && last.stopReason === "stop", JSON.stringify(last));
+  });
+}
+
+test("hidden tools are the current transcript tools the last turn did not send", () => {
+  const declare = (name: string) => ({
+    name,
+    description: name,
+    parameters: Type.Object({}),
+  });
+  const messages: Message[] = [
+    {
+      role: "system",
+      content: "prompt",
+      toolsAdded: [declare("read"), declare("report"), declare("codemode")],
+      timestamp: 0,
+    },
+    { role: "system", content: "", toolsRemoved: [declare("codemode")], timestamp: 1 },
+    { role: "system", content: "", toolsAdded: [declare("codemode")], timestamp: 2 },
+  ];
+  // OAuth requests send Claude Code's capitalized name for `read`.
+  const sent = { tools: [{ name: "Read" }, { name: "codemode" }] };
+  const hidden = hiddenTools(messages, sent);
+  assert.deepEqual([...hidden], ["report"]);
+  const projected = withoutHiddenTools(messages, hidden);
+  assert.deepEqual(
+    projected.flatMap((message) =>
+      message.role === "system" ? (message.toolsAdded ?? []).map((tool) => tool.name) : [],
+    ),
+    ["read", "codemode", "codemode"],
+  );
+  assert.equal(withoutHiddenTools(messages, new Set()).length, messages.length);
 });

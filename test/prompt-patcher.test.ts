@@ -1,19 +1,21 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
-import { pathToFileURL } from "node:url";
-import { getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
+import {
+  DefaultResourceLoader,
+  getPackageDir,
+  SettingsManager,
+  VERSION,
+} from "@earendil-works/pi-coding-agent";
 import {
   ISOLATED_REPLACEMENT_FILE,
   isolatePromptPatcher,
-  PARENT_PACKAGE_DIR_VARIABLE,
   PATCHER_SETTINGS_FILE,
-  parentPackageDirectory,
   resolveReplacementFile,
-  retargetPackageDirectory,
   selectReplacementFile,
 } from "./prompt-patcher.ts";
 
@@ -25,69 +27,14 @@ type PatcherHandler = (
     abort: () => void;
     ui: { notify: (message: string, level: "error") => void };
   },
-) => unknown;
-
-type PatcherExtension = (pi: {
-  on: (event: "before_provider_request", handler: PatcherHandler) => void;
-}) => void;
+) => Promise<unknown>;
 
 const PROVIDER = "anthropic";
 const MODEL = "claude-fable-5-1";
-// The installed patcher is the one both live tests load. Resolve it before any test changes
-// PI_CODING_AGENT_DIR.
-const installedPatcher = join(
-  getAgentDir(),
-  "npm/node_modules/pi-system-prompt-patcher/extensions/index.ts",
+// The pinned development dependency is the patcher both live tests load.
+const pinnedPatcher = fileURLToPath(
+  new URL("../node_modules/pi-system-prompt-patcher/extensions/index.ts", import.meta.url),
 );
-const requiresPatcher = {
-  skip: existsSync(installedPatcher)
-    ? false
-    : "Install pi-system-prompt-patcher under Pi's global npm directory.",
-};
-
-test("retargets package paths without changing replacement text or source rules", () => {
-  const from = resolve("synthetic/original-pi");
-  const to = resolve("synthetic/selected-pi");
-  const rules = Object.freeze([
-    Object.freeze({ target: `${from}/`, replacement: "replacement directory" }),
-    Object.freeze({
-      target: `Read ${from}/docs and ${from}/README.md`,
-      replacement: `${from}/must-remain-unchanged`,
-    }),
-    Object.freeze({ target: `${from}-other/docs`, replacement: "" }),
-    Object.freeze({ target: "Unrelated instruction", replacement: "Updated instruction" }),
-  ]);
-  const original = JSON.stringify(rules);
-  assert.deepEqual(retargetPackageDirectory(rules, from, to), [
-    { target: `${to}/`, replacement: "replacement directory" },
-    {
-      target: `Read ${to}/docs and ${to}/README.md`,
-      replacement: `${from}/must-remain-unchanged`,
-    },
-    { target: `${from}-other/docs`, replacement: "" },
-    { target: "Unrelated instruction", replacement: "Updated instruction" },
-  ]);
-  assert.equal(JSON.stringify(rules), original);
-});
-
-test("keeps rules unchanged when package directories already match", () => {
-  const root = resolve("synthetic/pi");
-  const rules = [{ target: `${root}/docs`, replacement: "Documentation" }];
-  assert.deepEqual(retargetPackageDirectory(rules, `${root}/`, root), rules);
-});
-
-test("rejects invalid prompt-patcher rules instead of dropping them", () => {
-  for (const [rules, message] of [
-    [{}, /Prompt-patcher replacements must be an array/],
-    [[null], /Expected a JSON object/],
-    [[{ target: "", replacement: "text" }], /A match target is required/],
-    [[{ target: 1, replacement: "text" }], /A match target is required/],
-    [[{ target: "text" }], /Replacement text is required/],
-    [[{ target: "text", replacement: null }], /Replacement text is required/],
-  ] as const) {
-    assert.throws(() => retargetPackageDirectory(rules, "original", "selected"), message);
-  }
-});
 
 test("selects the model file over the provider file like the patcher", () => {
   const settings = {
@@ -162,7 +109,7 @@ for (const [reference, describeSettings] of [
     }),
   ],
 ] as const) {
-  test(`isolates ${reference} rules for the selected package`, async (t) => {
+  test(`isolates ${reference} rules unchanged for the patcher to read`, async (t) => {
     const temporary = await mkdtemp(join(tmpdir(), "anthropic-patcher-"));
     t.after(() => rm(temporary, { recursive: true, force: true }));
     // Home-relative references resolve through HOME, so the synthetic home lives in the
@@ -170,8 +117,8 @@ for (const [reference, describeSettings] of [
     const home = join(temporary, "home");
     const source = join(home, "agent");
     const agent = join(temporary, "isolated");
-    const from = join(temporary, "original-pi");
-    const to = join(temporary, "selected-pi");
+    // The pinned patcher runs in this process, so the placeholder resolves to the repository Pi.
+    const piPackageDir = resolve(getPackageDir());
     await mkdir(join(source, "rules"), { recursive: true });
     await mkdir(join(home, "rules"), { recursive: true });
     await mkdir(agent);
@@ -181,8 +128,8 @@ for (const [reference, describeSettings] of [
         : join(source, "rules/anthropic.json");
     const ruleText = JSON.stringify([
       {
-        target: `Main documentation: ${from}/README.md`,
-        replacement: `Docs moved from ${from}/`,
+        target: "Main documentation: {piPackageDir}/README.md",
+        replacement: "Docs moved to /opt/docs/{piVersion}/",
       },
       { target: "Unrelated instruction", replacement: "Updated instruction" },
     ]);
@@ -197,8 +144,6 @@ for (const [reference, describeSettings] of [
       agentDir: agent,
       provider: PROVIDER,
       model: MODEL,
-      from,
-      to,
     });
     assert.equal(isolated, join(agent, ISOLATED_REPLACEMENT_FILE));
     assert.deepEqual(JSON.parse(await readFile(join(agent, PATCHER_SETTINGS_FILE), "utf8")), {
@@ -207,83 +152,24 @@ for (const [reference, describeSettings] of [
     // The source configuration and rules are untouched.
     assert.equal(await readFile(rules, "utf8"), ruleText);
     assert.equal(await readFile(join(source, PATCHER_SETTINGS_FILE), "utf8"), settingsText);
-    assert.deepEqual(JSON.parse(await readFile(isolated, "utf8")), [
-      {
-        target: `Main documentation: ${to}/README.md`,
-        replacement: `Docs moved from ${from}/`,
-      },
-      { target: "Unrelated instruction", replacement: "Updated instruction" },
-    ]);
+    assert.equal(await readFile(isolated, "utf8"), ruleText);
 
-    await t.test("the installed patcher reads the isolated rules", requiresPatcher, async (t) => {
-      const handler = await loadInstalledPatcher(temporary);
+    await t.test("the pinned patcher reads the isolated rules", async () => {
+      const handler = await loadPinnedPatcher(temporary);
       const payload = {
-        system: `Main documentation: ${to}/README.md\nUnrelated instruction`,
+        system: `Main documentation: ${piPackageDir}/README.md\nUnrelated instruction`,
         messages: [{ role: "user", content: "unchanged" }],
       };
       const applied = requestContext();
-      assert.deepEqual(handler({ payload }, applied.ctx), {
+      assert.deepEqual(await handler({ payload }, applied.ctx), {
         ...payload,
-        system: `Docs moved from ${from}/\nUpdated instruction`,
+        system: `Docs moved to /opt/docs/${VERSION}/\nUpdated instruction`,
       });
       assert.deepEqual(applied.errors, []);
       assert.equal(applied.aborts.count, 0);
-
-      // Regression: settings copied unchanged next to a retargeted copy leave that copy unread. The
-      // patcher resolves the configured reference itself, so it either reads the original rules,
-      // which name the original package directory, or finds no file at all.
-      const copied = join(temporary, "copied");
-      await mkdir(copied);
-      await writeFile(join(copied, PATCHER_SETTINGS_FILE), settingsText);
-      await writeFile(join(copied, ISOLATED_REPLACEMENT_FILE), await readFile(isolated, "utf8"));
-      process.env["PI_CODING_AGENT_DIR"] = copied;
-      // The patcher also logs the expected failure; keep the test output clean.
-      t.mock.method(console, "error", () => undefined);
-      const unchanged = requestContext();
-      assert.equal(handler({ payload }, unchanged.ctx), undefined);
-      assert.equal(unchanged.errors.length, 1);
-      assert.match(unchanged.errors[0] ?? "", /target was not found|failed to read/);
-      assert.equal(unchanged.aborts.count, reference === "relative" ? 0 : 1);
     });
   });
 }
-
-test("reads the captured parent package directory and verifies it is a Pi package", async (t) => {
-  const temporary = await mkdtemp(join(tmpdir(), "anthropic-parent-pi-"));
-  t.after(() => rm(temporary, { recursive: true, force: true }));
-  const home = join(temporary, "home");
-  const pi = join(home, ".pi/pi-coding-agent");
-  await mkdir(pi, { recursive: true });
-  await writeFile(
-    join(pi, "package.json"),
-    JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.87.0" }),
-  );
-  withEnvironment(t, { HOME: home });
-  assert.equal(await parentPackageDirectory({ [PARENT_PACKAGE_DIR_VARIABLE]: pi }), pi);
-  assert.equal(
-    await parentPackageDirectory({ [PARENT_PACKAGE_DIR_VARIABLE]: "~/.pi/pi-coding-agent" }),
-    pi,
-  );
-  // An empty capture supplies no known source package path.
-  assert.equal(await parentPackageDirectory({ [PARENT_PACKAGE_DIR_VARIABLE]: "" }), undefined);
-  // Without a capture the in-process package directory is the parent's.
-  assert.equal(await parentPackageDirectory({}), getPackageDir());
-  const other = join(temporary, "other");
-  await mkdir(other);
-  await assert.rejects(
-    parentPackageDirectory({ [PARENT_PACKAGE_DIR_VARIABLE]: other }),
-    /is not a Pi package directory/,
-  );
-  await writeFile(join(other, "package.json"), JSON.stringify({ name: "another-package" }));
-  await assert.rejects(
-    parentPackageDirectory({ [PARENT_PACKAGE_DIR_VARIABLE]: other }),
-    /is not a Pi package directory/,
-  );
-  await assert.rejects(
-    parentPackageDirectory({ [PARENT_PACKAGE_DIR_VARIABLE]: join(temporary, "missing") }),
-    /is not a Pi package directory/,
-  );
-});
 
 test("isolation preserves missing settings and a configured provider's no-op behavior", async (t) => {
   const temporary = await mkdtemp(join(tmpdir(), "anthropic-patcher-"));
@@ -297,8 +183,6 @@ test("isolation preserves missing settings and a configured provider's no-op beh
     agentDir: agent,
     provider: PROVIDER,
     model: MODEL,
-    from: "a",
-    to: "b",
   };
   assert.equal(await isolatePromptPatcher(options), undefined);
   assert.equal(existsSync(join(agent, PATCHER_SETTINGS_FILE)), false);
@@ -313,32 +197,26 @@ test("isolation preserves missing settings and a configured provider's no-op beh
   assert.equal(existsSync(join(agent, ISOLATED_REPLACEMENT_FILE)), false);
 });
 
-// Node does not strip types under node_modules, so import an exact copy of the installed source.
-// The patcher imports only Node built-ins.
-async function loadInstalledPatcher(temporary: string): Promise<PatcherHandler> {
-  const copy = join(temporary, "pi-system-prompt-patcher.ts");
-  await copyFile(installedPatcher, copy);
-  const module: unknown = await import(pathToFileURL(copy).href);
-  const extension = object(module)["default"];
-  assert.ok(isPatcherExtension(extension), "The patcher exports a default factory.");
-  let handler: PatcherHandler | undefined;
-  extension({
-    on(_event, candidate) {
-      handler = candidate;
-    },
+// Load the patcher's TypeScript through Pi so host imports use the same aliases as a real session.
+async function loadPinnedPatcher(temporary: string): Promise<PatcherHandler> {
+  const loader = new DefaultResourceLoader({
+    cwd: temporary,
+    agentDir: join(temporary, "loader-agent"),
+    settingsManager: SettingsManager.inMemory(),
+    additionalExtensionPaths: [pinnedPatcher],
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
   });
+  await loader.reload();
+  const loaded = loader.getExtensions();
+  assert.deepEqual(loaded.errors, []);
+  const extension = loaded.extensions.find((candidate) => candidate.path === pinnedPatcher);
+  assert.ok(extension, "Pi loads the pinned patcher.");
+  const [handler] = extension.handlers.get("before_provider_request") ?? [];
   assert.ok(handler, "The patcher registers a before_provider_request handler.");
   return handler;
-}
-
-function isPatcherExtension(value: unknown): value is PatcherExtension {
-  return typeof value === "function";
-}
-
-// A module namespace is not a JSON object; read the default export without asserting a type.
-function object(value: unknown): Record<string, unknown> {
-  assert.ok(typeof value === "object" && value !== null, "Expected a module namespace.");
-  return Object.fromEntries(Object.entries(value));
 }
 
 function requestContext() {

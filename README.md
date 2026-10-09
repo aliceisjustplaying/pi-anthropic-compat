@@ -24,8 +24,10 @@ Load this extension after any extension that rewrites Anthropic requests in
 `before_provider_request`. Such rewrites loaded later are not captured in the
 summary request's system/tools template.
 
-Requires **Pi 0.87.0 or newer** and Node.js 22.19 or newer. Releases are
-validated against Pi 0.87.1. Opus 5.5 requires Pi 0.87.1's model catalog.
+Requires Pi `>=1.1.0 <1.2.0` and Node.js 22.19 or newer. Releases are
+validated against Pi 1.1.0. The extension refuses to load on a Pi older than
+1.1.0, because Pi does not enforce the package's peer range when it installs
+packages.
 
 ## Install
 
@@ -60,6 +62,14 @@ This captures the final system instructions and tool definitions after other
 extensions have transformed them. The capture persists in the session, so a
 resumed session does not need another turn.
 
+When thinking is enabled and Pi's split keeps recent messages, signed thinking in
+kept messages is not bound to its original prefix; Anthropic drops it by default
+and no `prefix_mismatch_behavior` is requested.
+
+Pi codemode's `only` mode hides direct tools from turn requests, but the
+transcript still declares them. Summary requests leave out every current
+transcript tool that the last turn request did not send, as its saved request
+template records, so they declare the tools the turns sent.
 
 ### Pi lifecycle
 
@@ -76,7 +86,8 @@ summaries still replay until another Pi compaction replaces them.
 
 This version supports the direct Claude API and these documented model IDs:
 
-- `claude-sonnet-5`, `claude-sonnet-4-6`
+- `claude-haiku-5-5`
+- `claude-sonnet-5-5`, `claude-sonnet-5`, `claude-sonnet-4-6`
 - `claude-opus-5-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`
 - `claude-fable-5-1`, `claude-fable-5`
 - `claude-mythos-5-1`, `claude-mythos-5`, `claude-mythos-preview`
@@ -84,6 +95,14 @@ This version supports the direct Claude API and these documented model IDs:
 The live Models API must also report support. Haiku 4.5 does not support native
 on-demand compaction. Unsupported models, other providers, and proxies retain
 Pi's ordinary compaction behavior.
+
+**Pi's virtual models are not supported.** Native compaction checks the
+selected model, not the model that answers a request. Pi's experimental virtual models, registered with
+`pi.registerVirtualModel()`, stay selected while Pi routes each request to a
+physical model. With a virtual model selected, `/compact` and automatic
+compaction use Pi's ordinary compaction. This holds even when the router sends
+every request to a supported Anthropic model. Select that model directly to use
+native compaction.
 
 When switching to an unsupported model or provider, Pi's readable summary
 remains available as ordinary context. Returning to a supported Anthropic
@@ -185,9 +204,10 @@ modes. `/compact <instructions>` supplies additional summary guidance.
 ## Development
 
 ```sh
-npm ci --ignore-scripts
-npx tsc --noEmit -p .
-npm test
+mise trust
+mise install
+mise run init
+mise run check
 pi -e .
 ```
 

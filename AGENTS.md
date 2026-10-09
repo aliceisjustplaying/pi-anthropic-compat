@@ -6,12 +6,13 @@
 - Native compaction must fail closed. Do not silently substitute a plain-text summary after native failure.
 - Preserve exact native blocks and signatures. Never print credentials, signed block contents, or raw provider error bodies.
 - Keep final provider-payload transforms effective, including the Anthropic system-prompt patcher.
+- Anthropic live tests keep normal tool, capability, extension, and resource loading enabled. Never restrict tools or disable resources to simplify the harness. Preserve the effective prompt-patcher rules in isolated test state.
 - Keep-tail compaction must use verified earlier native requests and preserve the retained messages exactly. Never infer native boundaries from displayed turn counts or silently fall back to full-history compaction.
 - Keep request-boundary records compact. Persist hashes rather than a complete transcript copy for every request.
-- Validate retained thinking with Fable 5.1 and Opus 5.5 at low effort, real signed thinking blocks, explicit error enforcement, and rejection controls. Never increase live-test effort without authorization.
-- The release script must run `mise run test:live` against its exact candidate archive before signing. This runs both models' SDK and packaged-CLI tests on the repository Pi, then repeats the Fable CLI test against Mise-installed Pi. Cover both full-history and retained-message compaction for Opus 5.5. A missing prerequisite or failed live test blocks signing and tagging. Keep the post-commit reproducibility rebuild free of duplicate live requests. SDK tests alone do not establish runtime compatibility.
-- Bind each packaged-CLI test's `PI_PACKAGE_DIR` to the selected executable's package directory. Run tests through the Mise tasks, which bind in-process `PI_PACKAGE_DIR` to the repository Pi and record the parent's package root in `PI_ANTHROPIC_PARENT_PACKAGE_DIR`. Never bind ordinary Pi launches globally.
-- Resolve the effective prompt-patcher rules the way the patcher does (model file over provider file; relative, absolute, and `~/` references), copy them into the isolated agent directory, and point isolated settings at the copy. Adjust matching package paths only in those temporary targets. Preserve replacement text and global configuration.
+- Validate retained thinking with Fable 5.1, Opus 5.5, Sonnet 5.5, and Haiku 5.5 at low effort, real signed thinking blocks, explicit error enforcement, and rejection controls. Never increase live-test effort without authorization.
+- The release script must run `npm run test:live` against its exact candidate archive before signing. This runs every validated model's SDK and packaged-CLI tests on the repository Pi with the pinned `pi-system-prompt-patcher` development dependency. Never depend on a globally installed Pi or patcher. Cover both full-history and retained-message compaction for Opus 5.5, Sonnet 5.5, and Haiku 5.5. A missing prerequisite or failed live test blocks signing and tagging. Keep the post-commit reproducibility rebuild free of duplicate live requests. SDK tests alone do not establish runtime compatibility.
+- Never bind `PI_PACKAGE_DIR` for tests. `npm test` and `npm run test:live` remove an inherited value so each Pi resolves its own package directory.
+- Resolve the effective prompt-patcher rules the way the patcher does (model file over provider file; relative, absolute, and `~/` references), copy them into the isolated agent directory, and point isolated settings at the copy. Copy rules unchanged; rules that name Pi's package directory use the patcher's `{piPackageDir}` placeholder. Preserve global configuration.
 - Read prompt and tool declarations from transcript system messages, never from `getSystemPrompt()` or tool lists. Serialize retained tails behind the prompt snapshot Pi records on compaction entries.
 - Background compaction remains out of scope.
 - Keep `/anthropic-settings` aligned with `/codex-settings`: Enter edits drafts,
@@ -24,7 +25,6 @@
   interaction tests in `test/settings-menu.test.ts`.
 - Preserve unrelated concurrent filesystem changes. Ask only when they directly conflict with scoped work.
 - Run complete non-writing validation through `mise run check`.
-- Run `npm run check` and `npm test` before committing meaningful code changes.
 - Run `npm run pack:dry` to inspect the npm package contents before release.
 - Keep `.github/npm-package-files` synchronized with every intentional package-content change; local release validation and both CI jobs enforce it exactly.
 - Use Conventional Commits and maintain `CHANGELOG.md` in Keep a Changelog style; add entries for `feat:` and `fix:` changes under `Unreleased`.
