@@ -1,10 +1,19 @@
 import { calculateCost, type Model, type Api, type Usage } from "@earendil-works/pi-ai";
+import { MAX_INSTRUCTIONS_LENGTH } from "./config.ts";
 import { object, objects, type JsonObject } from "./json.ts";
 
 export const COMPACTION_BETA = "compact-2026-09-04";
 export const CHECKPOINT_TYPE = "pi-anthropic-compat";
 export const TEMPLATE_TYPE = "pi-anthropic-compat-template";
 export const BOUNDARY_TYPE = "pi-anthropic-compat-boundary";
+
+/**
+ * Shared `pi.events` channel that names why an extension cancelled a compaction. Pi reports only
+ * "Compaction cancelled", so an extension that requested the compaction, such as
+ * pi-compact-assistant, reads the reason here. The payload is `{ source, reason }`, where `reason`
+ * is a complete sentence without provider error text.
+ */
+export const COMPACTION_CANCELLED_CHANNEL = "compaction:cancelled";
 
 const MODELS = new Set([
   "claude-haiku-5-5",
@@ -34,6 +43,8 @@ export type Checkpoint = {
   version: 1;
   model: string;
   block: JsonObject;
+  /** Definitions of the tools the block's `tool_changes` name, from the summary request. */
+  tools?: JsonObject[];
 };
 
 export function checkpoint(details: unknown): Checkpoint | undefined {
@@ -51,7 +62,91 @@ export function checkpoint(details: unknown): Checkpoint | undefined {
     version: 1,
     model: data["model"],
     block: signedBlock(data["block"]),
+    // Checkpoints written before 0.0.15 have no tool definitions.
+    ...(Array.isArray(data["tools"]) ? { tools: objects(data["tools"]) } : {}),
   };
+}
+
+function toolName(tool: JsonObject): string | undefined {
+  return typeof tool["name"] === "string" ? tool["name"] : undefined;
+}
+
+/**
+ * Tools the block's `tool_changes` name by reference. With the inline-tools beta, Anthropic
+ * records the net tool changes of the summarized turns in the block, relative to the summary
+ * request's `tools`. A reference must name a tool declared in a later request's `tools`.
+ */
+export function referencedTools(block: JsonObject): string[] {
+  const changes = block["tool_changes"];
+  if (!Array.isArray(changes)) return [];
+  const names = objects(changes).flatMap((change) => {
+    const tool = object(change["tool"]);
+    const name = tool["type"] === "tool_reference" ? toolName(tool) : undefined;
+    return name === undefined ? [] : [name];
+  });
+  return [...new Set(names)];
+}
+
+/** Definitions of the tools a request's messages add inline, in order. */
+function inlineDefinitions(payload: JsonObject): JsonObject[] {
+  const messages = payload["messages"];
+  return (Array.isArray(messages) ? objects(messages) : []).flatMap((message) => {
+    const content = message["content"];
+    if (!Array.isArray(content)) return [];
+    return objects(content).flatMap((block) => {
+      if (block["type"] !== "tool_addition") return [];
+      const tool = object(block["tool"]);
+      return tool["type"] === "tool_definition" ? [object(tool["definition"])] : [];
+    });
+  });
+}
+
+/**
+ * Definitions of the named tools, from a request's `tools` and the tools its messages define
+ * inline. A later definition of a name replaces an earlier one.
+ */
+export function toolDefinitions(payload: JsonObject, names: readonly string[]): JsonObject[] {
+  if (names.length === 0) return [];
+  const found = new Map<string, JsonObject>();
+  const record = (definition: JsonObject) => {
+    const name = toolName(definition);
+    if (name !== undefined && names.includes(name)) found.set(name, definition);
+  };
+  const tools = payload["tools"];
+  if (Array.isArray(tools)) objects(tools).forEach(record);
+  inlineDefinitions(payload).forEach(record);
+  return names.flatMap((name) => {
+    const definition = found.get(name);
+    return definition ? [definition] : [];
+  });
+}
+
+/**
+ * Declare every tool the block names that the request's `tools` lacks. Pi declares the tools that
+ * are current after compaction, so a tool the summarized turns removed is missing, and Anthropic
+ * rejects the block's removal of it. Declared again, the block removes it, so the model is offered
+ * exactly Pi's current tools.
+ */
+function declareReferencedTools(payload: JsonObject, saved: Checkpoint): JsonObject {
+  const tools = payload["tools"] === undefined ? [] : objects(payload["tools"]);
+  const declared = new Set(tools.flatMap((tool) => toolName(tool) ?? []));
+  const missing = referencedTools(saved.block).filter((name) => !declared.has(name));
+  if (missing.length === 0) return payload;
+  const definitions = saved.tools ?? [];
+  const added = missing.map((name) => {
+    const definition = definitions.find((tool) => toolName(tool) === name);
+    if (!definition) {
+      throw new Error(
+        `The compaction summary refers to the tool ${name}, whose definition was not recorded.`,
+      );
+    }
+    // The summary request may have marked this tool as a cache breakpoint. Anthropic limits a
+    // request to four, and Pi places its own.
+    const result = { ...definition };
+    delete result["cache_control"];
+    return result;
+  });
+  return { ...payload, tools: [...tools, ...added] };
 }
 
 export function signedBlock(value: unknown): JsonObject {
@@ -81,6 +176,7 @@ export function addBeta(payload: JsonObject, beta = COMPACTION_BETA): JsonObject
 
 export function replay(payload: JsonObject, saved: Checkpoint | undefined): JsonObject {
   if (!saved) return payload;
+  payload = declareReferencedTools(payload, saved);
   const messages = objects(payload["messages"]);
   for (const message of messages) {
     if (
@@ -107,10 +203,87 @@ export function replay(payload: JsonObject, saved: Checkpoint | undefined): Json
   });
 }
 
+/** Anthropic rejects a request with more cache breakpoints than this. */
+const MAX_CACHE_BREAKPOINTS = 4;
+// Content blocks Anthropic accepts a cache breakpoint on. Thinking blocks cannot carry one.
+const CACHEABLE_BLOCKS = new Set([
+  "text",
+  "image",
+  "document",
+  "tool_use",
+  "tool_result",
+  "tool_addition",
+  "tool_removal",
+]);
+
+function breakpoints(blocks: unknown): JsonObject[] {
+  return Array.isArray(blocks)
+    ? objects(blocks).filter((block) => block["cache_control"] !== undefined)
+    : [];
+}
+
+function cacheable(block: JsonObject): boolean {
+  const type = block["type"];
+  if (typeof type !== "string" || !CACHEABLE_BLOCKS.has(type)) return false;
+  return type !== "text" || (typeof block["text"] === "string" && block["text"].length > 0);
+}
+
+/**
+ * Mark the last cacheable message block as a cache breakpoint when no message carries one.
+ *
+ * Pi marks the last message only when it is a user, system, or tool-result message. A summary
+ * request built after a finished response ends with that response, so without a message
+ * breakpoint Anthropic reads only the cached tools and system prompt. At a breakpoint on the
+ * response, Anthropic finds the prefix the previous turn cached a few blocks earlier. The marker
+ * copies Pi's own system or tool breakpoint, so it follows the configured cache retention, and a
+ * request without one stays unmarked.
+ */
+export function markHistory(payload: JsonObject): JsonObject {
+  const messages = Array.isArray(payload["messages"]) ? objects(payload["messages"]) : [];
+  if (messages.some((message) => breakpoints(message["content"]).length > 0)) return payload;
+  const existing = [...breakpoints(payload["system"]), ...breakpoints(payload["tools"])];
+  const marker = existing[0]?.["cache_control"];
+  if (marker === undefined || existing.length >= MAX_CACHE_BREAKPOINTS) return payload;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const content = messages[index]?.["content"];
+    if (!Array.isArray(content)) continue;
+    const blocks = objects(content);
+    const last = blocks.findLastIndex(cacheable);
+    if (last < 0) continue;
+    const marked = blocks.map((block, position) =>
+      position === last ? { ...block, cache_control: marker } : block,
+    );
+    return {
+      ...payload,
+      messages: messages.map((message, position) =>
+        position === index ? { ...message, content: marked } : message,
+      ),
+    };
+  }
+  return payload;
+}
+
+/** The summary guidance used when the configuration sets no `summaryInstructions`. */
+export const DEFAULT_SUMMARY_INSTRUCTIONS =
+  "Write a concise continuation summary. Preserve the user's goals, constraints, decisions, file paths, completed work, outstanding tasks, and facts needed to continue.";
+
+/** Anthropic documents summarizers that try to call a tool, so every summary request forbids it. */
+const TEXT_ONLY = "Do not call tools. Respond with text only.";
+
+/**
+ * Anthropic's `instructions` replace its own summary prompt. Configured guidance replaces the
+ * default guidance, and guidance from `/compact <instructions>` follows both.
+ */
+export function summaryInstructions(configured?: string | null, custom?: string): string {
+  return [configured ?? DEFAULT_SUMMARY_INSTRUCTIONS, TEXT_ONLY, custom?.trim()]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 export function summaryPayload(
   payload: JsonObject,
   maxTokens: number,
-  instructions?: string,
+  instructions = summaryInstructions(),
 ): JsonObject {
   const result = addBeta({ ...payload, stream: false, max_tokens: maxTokens });
   delete result["context_management"];
@@ -129,18 +302,10 @@ export function summaryPayload(
     const thinking = object(payload["thinking"]);
     if (thinking["type"] === "adaptive") result["thinking"] = thinking;
   }
-  const custom = instructions?.trim();
-  if (custom && custom.length > 16_000)
+  if (instructions.length > MAX_INSTRUCTIONS_LENGTH)
     throw new Error("Compaction instructions exceed 16,000 characters.");
-  result["compaction"] = {
-    type: "summarize",
-    instructions: [
-      "Write a concise continuation summary. Preserve the user's goals, constraints, decisions, file paths,",
-      "completed work, outstanding tasks, and facts needed to continue. Do not call tools. Respond with text only.",
-      custom ?? "",
-    ].join(" "),
-  };
-  return result;
+  result["compaction"] = { type: "summarize", instructions };
+  return markHistory(result);
 }
 
 function tokenCount(value: unknown): number {
@@ -207,5 +372,9 @@ export function template(payload: JsonObject): JsonObject {
   for (const key of ["system", "tools", "thinking", "output_config"] as const) {
     if (payload[key] !== undefined) result[key] = payload[key];
   }
+  // Pi keeps `tools` fixed for models that accept tool changes mid-conversation and defines
+  // later tools inline. Their names complete the set of tools the request sent.
+  const inline = [...new Set(inlineDefinitions(payload).flatMap((tool) => toolName(tool) ?? []))];
+  if (inline.length > 0) result["inlineTools"] = inline;
   return result;
 }

@@ -9,6 +9,7 @@ import {
 import {
   convertToLlm,
   type ExtensionAPI,
+  type ExtensionContext,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { sendSummaryRequest, supportsCompaction } from "./client.ts";
@@ -16,14 +17,19 @@ import type { Config } from "./config.ts";
 import { object, objects, type JsonObject } from "./json.ts";
 import {
   CHECKPOINT_TYPE,
+  COMPACTION_CANCELLED_CHANNEL,
   TEMPLATE_TYPE,
   checkpoint,
   eligibleModel,
   parseSummary,
+  referencedTools,
   replay,
+  summaryInstructions,
   summaryPayload,
   template,
+  toolDefinitions,
 } from "./protocol.ts";
+import { PROMPT_FIRST_TYPE, promptFirst, promptFirstRecorded } from "./prompt-order.ts";
 import { loadSessionConfig, registerSettings } from "./settings.ts";
 
 // This fork never replaces the `anthropic` provider. Another extension (for example
@@ -32,10 +38,16 @@ import { loadSessionConfig, registerSettings } from "./settings.ts";
 // before the request body is serialized. Summary requests go through
 // `ctx.modelRegistry.streamSimple`, so they pass through the registered provider too.
 
+/**
+ * Reject tool calls that still await a result. Pi never sends an errored or aborted response,
+ * such as one the user interrupted while it streamed a tool call, so its tool calls never get a
+ * result and are skipped here as well.
+ */
 export function requireCompletedTools(messages: readonly Message[]): void {
   const pending = new Set<string>();
   for (const message of messages) {
     if (message.role === "assistant") {
+      if (message.stopReason === "error" || message.stopReason === "aborted") continue;
       for (const item of message.content) {
         if (item.type === "toolCall") pending.add(item.id);
       }
@@ -49,19 +61,25 @@ export function requireCompletedTools(messages: readonly Message[]): void {
 /**
  * Current transcript tools the last turn request did not send. Pi hides them
  * from requests in codemode `only` mode. Pi hides only current tools, and a
- * tool a turn removed is no longer current. Names compare case-insensitively,
- * because OAuth requests send Claude Code's capitalized names for Pi's tools.
+ * tool a turn removed is no longer current. A request sends the tools in its
+ * `tools` and the ones its messages define inline. Names compare
+ * case-insensitively, because OAuth requests send Claude Code's capitalized
+ * names for Pi's tools.
  */
 export function hiddenTools(
   messages: readonly Message[],
   savedTemplate: JsonObject,
 ): ReadonlySet<string> {
   const tools = savedTemplate["tools"];
-  const sent = new Set(
-    (Array.isArray(tools) ? objects(tools) : []).flatMap((tool) =>
+  const inline = savedTemplate["inlineTools"];
+  const sent = new Set([
+    ...(Array.isArray(tools) ? objects(tools) : []).flatMap((tool) =>
       typeof tool["name"] === "string" ? [tool["name"].toLowerCase()] : [],
     ),
-  );
+    ...(Array.isArray(inline) ? inline : []).flatMap((name) =>
+      typeof name === "string" ? [name.toLowerCase()] : [],
+    ),
+  ]);
   return new Set(
     getCurrentTools([...messages])
       .map((tool) => tool.name)
@@ -100,7 +118,15 @@ export function compactedTranscript(
 export function activeCheckpoint(entries: readonly SessionEntry[]) {
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
-    if (entry?.type === "compaction") return checkpoint(entry.details);
+    if (entry?.type !== "compaction") continue;
+    const saved = checkpoint(entry.details);
+    if (!saved || saved.tools) return saved;
+    const names = referencedTools(saved.block);
+    if (names.length === 0) return saved;
+    // Checkpoints written before 0.0.15 do not record the definitions of the tools their block
+    // names. The summary request declared the tools of the last turn before compaction.
+    const summarized = activeTemplate(entries.slice(0, index), saved.model);
+    return summarized ? { ...saved, tools: toolDefinitions(summarized, names) } : saved;
   }
   return undefined;
 }
@@ -126,6 +152,10 @@ class SummaryCaptured extends Error {
 
 export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = fetch): void {
   let config: Config | undefined;
+  // Pi can serialize a turn twice: after a strict-tool-limit rejection it retries once with
+  // preferred strict tools non-strict. Only the template of the request Anthropic accepted is
+  // recorded, when `after_provider_response` reports success.
+  let record: ((ctx: ExtensionContext) => void) | undefined;
 
   const configuration = (ctx: Parameters<typeof loadSessionConfig>[0]): Config => {
     config ??= loadSessionConfig(ctx);
@@ -133,17 +163,36 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
   };
   const reset = () => {
     config = undefined;
+    record = undefined;
   };
   pi.on("session_start", reset);
   pi.on("session_shutdown", reset);
 
-  // Once a signed checkpoint exists, it replaces Pi's readable summary on the wire.
+  // Once a signed checkpoint exists, it replaces Pi's readable summary on the wire. The event
+  // returns messages verbatim, so a changed list keeps every system message where it is.
   pi.on("context_with_system", (event, ctx) => {
-    if (!eligibleModel(ctx.model) || !activeCheckpoint(ctx.sessionManager.getBranch())) return;
-    return { messages: event.messages.filter((message) => message.role !== "compactionSummary") };
+    if (!eligibleModel(ctx.model)) return;
+    const branch = ctx.sessionManager.getBranch();
+    const saved = activeCheckpoint(branch);
+    const messages = saved
+      ? event.messages.filter((message) => message.role !== "compactionSummary")
+      : event.messages;
+    // Agent turns lead with the prompt, as Pi sends them without an earlier shell command. A
+    // branch starts moving its prompt only while native compaction is on, and keeps its order
+    // once it has recorded the move.
+    const recorded = promptFirstRecorded(branch);
+    const ordered =
+      recorded || configuration(ctx).enabled
+        ? promptFirst(messages, recorded, (message) =>
+            convertToLlm([message]).every((converted) => converted.role === "user"),
+          )
+        : undefined;
+    if (ordered && !recorded) pi.appendEntry(PROMPT_FIRST_TYPE, { version: 1 });
+    return ordered ? { messages: ordered } : saved ? { messages } : undefined;
   });
 
   pi.on("before_provider_request", (event, ctx) => {
+    record = undefined;
     const model = ctx.model;
     if (!eligibleModel(model)) return undefined;
     const payload = event.payload;
@@ -151,15 +200,21 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
     const request = object(payload);
     // Ignore requests for other models, such as nested calls by other extensions.
     if (request["model"] !== model.id) return undefined;
-    const branch = ctx.sessionManager.getBranch();
     if (configuration(ctx).enabled) {
       const next = template(request);
-      if (JSON.stringify(activeTemplate(branch, model.id)) !== JSON.stringify(next)) {
-        pi.appendEntry(TEMPLATE_TYPE, next);
-      }
+      record = (current) => {
+        const saved = activeTemplate(current.sessionManager.getBranch(), model.id);
+        if (JSON.stringify(saved) !== JSON.stringify(next)) pi.appendEntry(TEMPLATE_TYPE, next);
+      };
     }
-    const saved = activeCheckpoint(branch);
+    const saved = activeCheckpoint(ctx.sessionManager.getBranch());
     return saved ? replay(request, saved) : undefined;
+  });
+
+  pi.on("after_provider_response", (event, ctx) => {
+    const accepted = record;
+    record = undefined;
+    if (event.status >= 200 && event.status < 300) accepted?.(ctx);
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
@@ -203,10 +258,19 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
       const maxTokens = Math.min(configuration(ctx).maxSummaryTokens, model.maxTokens);
       const level = pi.getThinkingLevel();
 
-      let response: JsonObject | undefined;
-      let unsupported = false;
-      // The SDK reports any transport exception as "Connection error.", so keep the cause.
-      let failure: unknown;
+      const instructions = summaryInstructions(
+        configuration(ctx).summaryInstructions,
+        event.customInstructions,
+      );
+      // Serialize the summary request through the registered provider and send what comes out.
+      const attempt: {
+        response?: JsonObject;
+        /** The summary request before the registered provider's transform. */
+        payload?: JsonObject;
+        unsupported: boolean;
+        // The SDK reports any transport exception as "Connection error.", so keep the cause.
+        failure?: unknown;
+      } = { unsupported: false };
       const options: SimpleStreamOptions = {
         signal,
         sessionId: session,
@@ -225,7 +289,8 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
           if (replayed["model"] !== model.id) {
             throw new Error("A provider transform changed the summary model.");
           }
-          return summaryPayload(replayed, maxTokens, event.customInstructions);
+          attempt.payload = replayed;
+          return summaryPayload(replayed, maxTokens, instructions);
         },
         // The registered provider's fetch wrapper (for example pi-black's cch patch)
         // calls this transport last, with the final headers and body.
@@ -233,12 +298,19 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
           try {
             const request = new Request(input, init);
             if (!(await supportsCompaction(request, model.id, signal, fetcher))) {
-              unsupported = true;
+              attempt.unsupported = true;
             } else {
-              response = await sendSummaryRequest(request, signal, fetcher);
+              attempt.response = await sendSummaryRequest(request, signal, fetcher, {
+                onRetry: ({ attempt: retry, maxRetries, delayMs, reason }) => {
+                  ctx.ui.notify(
+                    `Native compaction failed (${reason}). Retrying in ${Math.ceil(delayMs / 1000)} s, attempt ${retry} of ${maxRetries}.`,
+                    "warning",
+                  );
+                },
+              });
             }
           } catch (error) {
-            failure = error;
+            attempt.failure = error;
           }
           throw new SummaryCaptured();
         },
@@ -247,6 +319,7 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
         .streamSimple(model, normalizeContext({ messages }), options)
         .result();
       signal.throwIfAborted();
+      const { response, unsupported, failure } = attempt;
       if (unsupported) {
         ctx.ui.notify(
           "This model does not support native compaction. Pi compaction remains available.",
@@ -260,6 +333,14 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
         throw new Error(result.errorMessage ?? "Could not send the Anthropic compaction request.");
       }
       const summary = parseSummary(response, model);
+      // Replay must declare every tool the block's net tool changes name.
+      const referenced = referencedTools(summary.block);
+      const referencedDefinitions = toolDefinitions(attempt.payload ?? {}, referenced);
+      if (referencedDefinitions.length !== referenced.length) {
+        throw new Error(
+          "The summary refers to a tool the summary request did not declare. History was preserved.",
+        );
+      }
       if (
         ctx.sessionManager.getSessionId() !== session ||
         ctx.sessionManager.getLeafId() !== leaf ||
@@ -274,13 +355,23 @@ export function registerCompatibility(pi: ExtensionAPI, fetcher: typeof fetch = 
           firstKeptEntryId: boundary,
           tokensBefore: event.preparation.tokensBefore,
           usage: summary.usage,
-          details: { type: CHECKPOINT_TYPE, version: 1, model: model.id, block: summary.block },
+          details: {
+            type: CHECKPOINT_TYPE,
+            version: 1,
+            model: model.id,
+            block: summary.block,
+            ...(referencedDefinitions.length > 0 ? { tools: referencedDefinitions } : {}),
+          },
         },
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Native compaction failed.";
       // No automatic switch to a text-summary algorithm after a native failure.
       ctx.ui.notify(message, "error");
+      pi.events.emit(COMPACTION_CANCELLED_CHANNEL, {
+        source: "pi-anthropic-compat",
+        reason: message,
+      });
       return { cancel: true };
     }
   });

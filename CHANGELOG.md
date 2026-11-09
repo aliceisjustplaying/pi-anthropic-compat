@@ -6,6 +6,116 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fork
+
+- Merge upstream 0.0.19. Require Pi `>=1.5.0 <1.6.0`.
+- Carried from upstream, adapted to the fork's provider-neutral design: the `summaryInstructions`
+  setting, HTTP 529 retries with announced backoff, error type and code in failure messages,
+  tool definitions recorded with the checkpoint so replay can declare tools the signed block
+  removes, inline tools in the saved template, the cache breakpoint on summary requests, the
+  `compaction:cancelled` event, and recording the template only for the request Anthropic accepted.
+- Move the prompt ahead of a shell command that precedes the first prompt in the
+  `context_with_system` event instead of a provider wrapper, only while native compaction is on or
+  after the branch recorded the move.
+- Not carried: upstream's provider replacement (`registerProvider`), `tail.ts` keep-tail with
+  request-boundary records and the `keepRecentTokens` setting, the strict-tool summary downgrade
+  (the saved template already holds the tools Pi's own retry sent), and the live and packaged-CLI
+  tests with their release gate.
+
+## [0.0.19] - 2026-11-04
+
+### Changed
+
+- Require Pi `>=1.5.0 <1.6.0`.
+
+## [0.0.18] - 2026-10-31
+
+### Added
+
+- A `summaryInstructions` configuration setting replaces the default summary guidance in every
+  native summary request, including automatic compaction. Guidance from `/compact <instructions>`
+  follows it. The limit of 16,000 characters now applies to the whole instruction text.
+
+## [0.0.17] - 2026-10-25
+
+### Fixed
+
+- A session that starts with a `!` shell command no longer loses its prompt cache and the
+  thinking of earlier responses when a tool is added or removed, for example when
+  pi-compact-assistant adds `compact`. Pi puts that command ahead of the prompt, so its Anthropic
+  provider sent the prompt inside the conversation and the full tool list in `tools` on every
+  request. The extension now moves the prompt first, and Pi keeps `tools` fixed and defines later
+  tools inline. Keep-tail compaction no longer cancels in such sessions. Sessions that already
+  received a response keep their order until their next compaction.
+- The native summary request no longer drops a tool added mid-conversation. It treated the tool
+  as hidden because it was missing from the request's `tools`, so the summary request diverged
+  from the turns at that point.
+- A native summary request after a finished response, as with `/compact` between turns, now
+  reads the conversation from the prompt cache. Pi set no cache breakpoint on a final response,
+  so the request read only the cached tools and system prompt and billed the conversation as
+  uncached input.
+
+## [0.0.16] - 2026-10-22
+
+### Added
+
+- Publish the reason for every cancelled native compaction on the shared `pi.events` channel
+  `compaction:cancelled` as `{ source: "pi-anthropic-compat", reason }`. Pi reports only
+  "Compaction cancelled", so extensions that request compaction, such as pi-compact-assistant,
+  can now tell the model why.
+
+## [0.0.15] - 2026-10-22
+
+### Fixed
+
+- A session no longer fails every request after compaction with "tool_addition/tool_removal
+  references unknown tool" when a tool was removed before compaction. Anthropic records the
+  removal in the signed summary, and the extension now declares the removed tool again so the
+  summary can remove it. Sessions already compacted by 0.0.14 recover on their next request.
+- Native compaction no longer fails on Anthropic's transient HTTP 529 `compaction_unavailable`
+  error. It retries up to 3 times after 2, 4, and 8 seconds, or after the server's `retry-after`
+  delay up to 60 seconds, as Pi does for its own compaction, and shows a warning before each
+  retry.
+- Compaction failure messages now name Anthropic's error type and error code, such as
+  `HTTP 529 overloaded_error, compaction_unavailable`, instead of only the HTTP status.
+
+## [0.0.14] - 2026-10-22
+
+### Fixed
+
+- Compaction no longer fails with "Resolve pending tool calls before native compaction" after
+  you interrupt a response while it streams a tool call. Pi never sends such an interrupted or
+  failed response, so its unanswered tool call no longer blocks every later compaction in the
+  session.
+
+## [0.0.13] - 2026-10-22
+
+### Changed
+
+- Require Pi `>=1.4.0 <1.5.0`.
+
+## [0.0.12] - 2026-10-17
+
+### Changed
+
+- Require Pi `>=1.3.0 <1.4.0`.
+
+## [0.0.11] - 2026-10-15
+
+### Changed
+
+- Require Pi `>=1.2.0 <1.3.0`.
+
+### Fixed
+
+- Full-history compaction no longer fails with "Too many strict tools" or another strict
+  tool limit while Pi's turns succeed through its non-strict retry. It sends
+  `strict: "prefer"` tools non-strict after such a turn and retries a rejected summary request
+  once without them, as Pi does. With **Native tail tokens** set, these sessions compact the full
+  history and show a warning, because retained messages cannot replay behind the changed tools.
+- Record the system instructions, tools, and request boundary only for the request Anthropic
+  accepted. A turn Pi retried no longer records the rejected attempt as well.
+
 ## [0.0.10] - 2026-10-08
 
 ### Added

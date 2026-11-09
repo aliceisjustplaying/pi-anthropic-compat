@@ -18,15 +18,16 @@ This fork differs from upstream:
   not bound to its original prefix, so Anthropic may drop it. No per-turn
   request-boundary entries are written.
 - **Nothing is recorded while native compaction is off.** The system/tools
-  template is recorded only when enabled, and only when it changes.
+  template is recorded only when enabled, only when it changes, and only for the
+  request Anthropic accepted.
 
 Load this extension after any extension that rewrites Anthropic requests in
 `before_provider_request`. Such rewrites loaded later are not captured in the
 summary request's system/tools template.
 
-Requires Pi `>=1.1.0 <1.2.0` and Node.js 22.19 or newer. Releases are
-validated against Pi 1.1.0. The extension refuses to load on a Pi older than
-1.1.0, because Pi does not enforce the package's peer range when it installs
+Requires Pi `>=1.5.0 <1.6.0` and Node.js 22.19 or newer. Releases are
+validated against Pi 1.5.0. The extension refuses to load on a Pi older than
+1.5.0, because Pi does not enforce the package's peer range when it installs
 packages.
 
 ## Install
@@ -66,10 +67,27 @@ When thinking is enabled and Pi's split keeps recent messages, signed thinking i
 kept messages is not bound to its original prefix; Anthropic drops it by default
 and no `prefix_mismatch_behavior` is requested.
 
+### Strict tool limits
+
+Anthropic rejects a request whose strict tools exceed its limits, such as more
+than 20 strict tools. Pi then retries the turn once with `strict: "prefer"` tools
+non-strict. The extension records the system instructions and tools of the
+request Anthropic accepted, once its response arrives, so a retried turn leaves
+one record and the summary request sends the same non-strict tools.
+
+### Tool changes
+
+When the summarized conversation adds or removes tools, Anthropic records their
+net effect in the signed summary. A removal there names a tool that Pi no
+longer declares after compaction. The extension records that tool's definition
+with the summary and declares it again on every later request, and the summary
+then removes it. The model is offered exactly Pi's current tools.
+
 Pi codemode's `only` mode hides direct tools from turn requests, but the
 transcript still declares them. Summary requests leave out every current
 transcript tool that the last turn request did not send, as its saved request
-template records, so they declare the tools the turns sent.
+template records, so they declare the tools the turns sent. The template lists
+the request's `tools` and the tools its messages defined inline.
 
 ### Pi lifecycle
 
@@ -119,8 +137,34 @@ an earlier branch rather than attempting native overflow recovery.
 
 Pending tool calls must have results before compaction. Empty or unsigned
 summaries, refusals, timeouts, aborted requests, unsupported responses, and
-concurrent session changes leave the original conversation intact. The
-extension does not retry billed summary requests automatically.
+concurrent session changes leave the original conversation intact.
+
+The summary request repeats the conversation the turns already cached. Pi marks
+a request's last message as a cache breakpoint only when it is a user, system,
+or tool-result message, so a summary request that ends with a response would
+read only the cached tools and system prompt.
+The extension then marks the last cacheable block of the summary request with
+Pi's own cache setting, so Anthropic reads the turns' cached prefix. It adds no
+breakpoint when Pi sent none or a request already has Anthropic's limit of four.
+
+Anthropic answers a transient compaction failure with HTTP 529
+`overloaded_error`, error code `compaction_unavailable`, and documents that the
+request should be retried. The extension retries a summary request that fails
+with HTTP 529, using Pi's default compaction budget: up to 3 retries after 2,
+4, and 8 seconds, or after the server's `retry-after` delay up to 60 seconds.
+A warning announces each retry.
+The compaction timeout still bounds the whole attempt, and aborting compaction
+cancels a pending retry. No other failure is retried. Failure messages name the
+HTTP status, Anthropic's error type, and its error code, never the provider's
+error text.
+
+Pi reports a cancelled compaction only as "Compaction cancelled". The extension
+shows its reason as an error notification and publishes it on the shared
+`pi.events` channel `compaction:cancelled` as `{ source: "pi-anthropic-compat",
+reason }`. The reason is a complete sentence without provider error text. An
+extension that requested the compaction, such as
+[`pi-compact-assistant`](https://github.com/2h2d-co/pi-compact-assistant), can
+pass it on to the model.
 
 Compaction is billed separately. Accounting uses `usage.iterations`, not the
 top-level usage fields, which can be zero on a successful summary request.
@@ -129,6 +173,29 @@ Failed summary requests can still incur charges.
 The extension stores system/tools templates (while enabled) and signed summaries
 in Pi's existing session file. It never stores authentication headers or logs raw
 provider error bodies. Treat session files as private conversation data.
+
+## Prompt order
+
+Pi writes the system message that declares the prompt and the initial tools
+when the first agent run starts. A `!` shell command run before the first
+prompt is already in the session, so it comes first. Pi's Anthropic provider
+then finds no leading prompt. It sends the prompt as a mid-conversation system
+message and the complete current tool list in `tools` on every request. A tool
+added or removed later, for example by an extension such as
+pi-compact-assistant, changes `tools`. That request misses the whole prompt
+cache, and Anthropic drops the signed thinking of earlier responses.
+
+While native compaction is on, the extension moves that system message ahead of
+the shell output in the `context_with_system` event. Pi then sends the prompt in
+`system`, keeps `tools` fixed, and defines later tools inline. The session
+records the move with a `pi-anthropic-compat-prompt-first` entry, and the order
+then holds for the rest of the branch, even after native compaction is turned
+off. Summary requests take their system instructions and tools from the saved
+template and carry no system message, so they need no reordering.
+
+Sessions that already received a response in the original order keep it until
+their next compaction, because moving the prompt would invalidate that
+response's thinking. Compaction leads the context with the prompt again.
 
 ## Settings
 
@@ -168,6 +235,22 @@ Settings are stored in `~/.pi/agent/pi-anthropic-compat.json`.
 | `maxSummaryTokens` | Integer from 1024 to 32768 |
 | `timeoutSeconds`   | Integer from 10 to 600     |
 
+`summaryInstructions` is a file-only setting. The menu does not show or change
+it. Its text replaces the extension's default summary guidance, which asks
+for a concise continuation summary. Its accepted values are a nonempty string of
+at most 16,000 characters, or `null` for the default. Every summary request
+adds the rule against tool calls after it, and `/compact <instructions>` adds
+its guidance last. Ask only to select or emphasize conversation content.
+Anthropic's native compaction has refused an instruction to state a fact absent
+from the conversation, and a refusal cancels the compaction. A change takes
+effect when a session starts or reloads.
+
+```json
+{
+  "summaryInstructions": "Summarize this conversation for the assistant that will continue the work. Keep each ongoing task's wording and priority exactly as the conversation last stated them."
+}
+```
+
 A trusted project's `.pi/pi-anthropic-compat.json` overrides global values.
 The menu saves to that file when it already exists. Otherwise it saves globally.
 Untrusted project configuration is ignored. Invalid configuration produces an
@@ -199,7 +282,8 @@ Session overrides retain their original conflict checks across menu reopenings.
 Conflicting external edits remain protected after reload or restart.
 
 The menu requires TUI mode. File configuration also works in print and RPC
-modes. `/compact <instructions>` supplies additional summary guidance.
+modes. `/compact <instructions>` supplies additional summary guidance after
+`summaryInstructions`.
 
 ## Development
 
